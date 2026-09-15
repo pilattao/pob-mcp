@@ -51,6 +51,7 @@ describe('handleRestoreSnapshot — live session sync', () => {
     const result = await handleRestoreSnapshot(context, {
       build_name: 'MyBuild.xml',
       snapshot_id: 'pre-sim',
+      reload_live: !!luaClient,
     });
 
     expect(luaClient.loadBuildXml).toHaveBeenCalledTimes(1);
@@ -60,20 +61,24 @@ describe('handleRestoreSnapshot — live session sync', () => {
     expect(result.content[0].text).toContain('Live PoB session reloaded');
   });
 
-  it('warns loudly — and does not claim success — when the live push fails', async () => {
+  it('returns an error and unknown live state when reload verification fails after file restore', async () => {
     const luaClient = makeLuaClient(true);
     const { context } = makeContext({ luaClient });
 
     const result = await handleRestoreSnapshot(context, {
       build_name: 'MyBuild.xml',
       snapshot_id: 'pre-sim',
+      reload_live: !!luaClient,
     });
 
     const text = result.content[0].text;
-    expect(text).toContain('WARNING');
+    expect(result).toMatchObject({ isError: true, structuredContent: {
+      fileRestored: true, liveReloadVerified: false, liveState: 'unknown',
+    } });
     expect(text).toContain('open_build_xml failed');
-    // Must tell the caller the in-memory state is stale, not merely that something errored.
-    expect(text).toContain('NOT reflect this restore');
+    expect(text).toMatch(/live.*state.*unknown/i);
+    expect(text).toMatch(/read.*again/i);
+    expect(text).not.toMatch(/still holding|pre-restore build|NOT reflect this restore/);
     expect(text).not.toContain('Live PoB session reloaded');
   });
 
@@ -83,6 +88,7 @@ describe('handleRestoreSnapshot — live session sync', () => {
     const result = await handleRestoreSnapshot(context, {
       build_name: 'MyBuild.xml',
       snapshot_id: 'pre-sim',
+      reload_live: false,
     });
 
     expect(result.content[0].text).toContain('Build restored from snapshot');
@@ -96,6 +102,7 @@ describe('handleRestoreSnapshot — live session sync', () => {
     await handleRestoreSnapshot(context, {
       build_name: 'MyBuild.xml',
       snapshot_id: 'pre-sim',
+      reload_live: !!luaClient,
     });
 
     expect(buildService.invalidateBuild).toHaveBeenCalledWith('MyBuild.xml');

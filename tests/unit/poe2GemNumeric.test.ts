@@ -17,8 +17,8 @@ function context(liveName='Fixture') {
       {index:1,name:'Active',gemId:'active',skillId:'activePlayer',level:18,quality:10,is_support:false,enabled:true},
       {index:2,name:'Support',gemId:'support',level:1,quality:0,is_support:true,enabled:true}]}]}),
     getGemDetail:async({gemName}:any)=>gems.find(g=>g.gemId===gemName),
-    evaluateGemSetups:async(p:any)=>{requests.push(p);return{baseline:{CombinedDPS:100,ManaCost:10,TotalEHP:1000},metric:p.metric??'CombinedDPS',
-      setups:p.setups ? p.setups.map((s:any)=>({...row,name:s.name})) : [row],ranking:[row],conditions:{skillSetId:3,evaluationGroupIndex:1,useSecondWeaponSet:true,configInput:{enemyLevel:83}},
+    evaluateGemSetups:async(p:any)=>{requests.push(p);return{baseline:{CombinedDPS:100,ManaCost:10,TotalEHP:1000},metric:p.resourceOnly?'resource-only':p.metric??'CombinedDPS',
+      setups:p.setups ? p.setups.map((s:any)=>({...row,name:s.name})) : [row],ranking:p.resourceOnly?[]:[row],conditions:{skillSetId:3,evaluationGroupIndex:1,useSecondWeaponSet:true,configInput:{enemyLevel:83}},
       search:{evaluations:1,eligibleCandidates:3,budget:48,truncated:false,algorithm:'fixture'},rollback:{xmlUnchanged:true,statsUnchanged:true,selectionsUnchanged:true,undoUnchanged:true}}},
     loadBuildXml:async()=>{throw new Error('Must not replace user build')},addGem:async()=>{throw new Error('Must not commit a gem edit')}};
   return{buildService:{parseBuildContent:parser.parseBuildContent.bind(parser),readBuild:async()=>build} as any,
@@ -85,4 +85,60 @@ describe('complete numeric comparison and explicit output selection',()=>{
     expect(ctx.requests[0].setups[1].gems[0]).toMatchObject({refIndex:1,level:19});
     expect(ctx.requests[0]).not.toHaveProperty('useSecondWeaponSet');
   });
+});
+
+describe('resource reporting and tied model results',()=>{
+  it('prints equal modeled metrics as ties without asserting equal combat performance',async()=>{
+    const ctx=context();const result=output(await handleCompareGemSetups(ctx,{build_name:'Fixture',setups:[
+      {name:'Current',gems:['Active','Support']},{name:'Upgrade',gems:['Active','Better']}]}));
+    expect(result).toContain('Ranking: Current = Upgrade');
+    expect(result).not.toContain('Current > Upgrade');
+    expect(result).toMatch(/infusion.*uptime|uptime.*infusion/i);
+  });
+  it('adds a direct edited-group resource comparison when evaluating another skill',async()=>{
+    const ctx=context();const original=ctx.client.evaluateGemSetups;
+    ctx.client.evaluateGemSetups=async(p:any)=>{
+      const response=await original(p);
+      return {...response,conditions:{...response.conditions,evaluationGroupIndex:p.evaluationGroupIndex??1},
+        setups:response.setups.map((r:any)=>({...r,output:{...r.output,WardCost:81,WardPerSecondCost:16.2,Cooldown:5},
+          gems:[{...r.gems[0],baseCosts:{Ward:134},baseCooldown:5.3},...r.gems.slice(1)]}))};
+    };
+    const result=output(await handleCompareGemSetups(ctx,{build_name:'Fixture',evaluation_skill_index:2,setups:[
+      {name:'18',gems:[{refIndex:1},{refIndex:2}]},{name:'19',gems:[{refIndex:1,level:19},{refIndex:2}]}]}));
+    expect(ctx.requests.map(p=>p.evaluationGroupIndex)).toEqual([3,1]);
+    expect(result).toContain('Direct resource comparison for edited group 1');
+    expect(result).toContain('WardCost: 81');expect(result).toContain('WardPerSecondCost: 16.2');
+    expect(result).toContain('before modifiers');expect(result).toContain('134');
+  });
+});
+
+it('can report a utility skill with native resource fields and no DPS',async()=>{
+  const ctx=context();const original=ctx.client.evaluateGemSetups;
+  ctx.client.evaluateGemSetups=async(p:any)=>{
+    const r=await original(p);return {...r,metric:'resource-only',baseline:{WardCost:81,Cooldown:5.3},ranking:[],
+      setups:r.setups.map((row:any)=>({...row,output:{WardCost:87,Cooldown:5.2},deltas:{WardCost:{absolute:6},Cooldown:{absolute:-0.1}}}))};
+  };
+  const text=output(await handleCompareGemSetups(ctx,{build_name:'Fixture',resource_only:true,setups:[
+    {name:'18',gems:[{refIndex:1},{refIndex:2}]},{name:'19',gems:[{refIndex:1,level:19},{refIndex:2}]}]}));
+  expect(ctx.requests[0].resourceOnly).toBe(true);
+  expect(text).toContain('WardCost: 87');expect(text).toContain('Cooldown: 5.2');
+  expect(text).not.toMatch(/CombinedDPS:|Ranking:/);
+});
+
+it('rejects an older evaluator that ignores resource-only mode',async()=>{
+  const ctx=context();const original=ctx.client.evaluateGemSetups;
+  ctx.client.evaluateGemSetups=async(p:any)=>({...await original(p),metric:'CombinedDPS'});
+  await expect(handleCompareGemSetups(ctx,{build_name:'Fixture',resource_only:true,setups:[
+    {name:'A',gems:['Active']},{name:'B',gems:['Active','Better']}]})).rejects.toThrow(/does not support resource-only/);
+});
+
+it('uses equal ranks for support candidates tied on the selected native metric',async()=>{
+  const ctx=context();const original=ctx.client.evaluateGemSetups;
+  ctx.client.evaluateGemSetups=async(p:any)=>{
+    const r=await original(p);return {...r,ranking:[{...row,name:'Current'},{...row,name:'Alternative'}]};
+  };
+  const text=output(await handleSuggestSupportGems(ctx,{build_name:'Fixture'}));
+  expect(text).toMatch(/1\. Current/);
+  expect(text).toMatch(/1\. Alternative \[tied on CombinedDPS\]/);
+  expect(text).not.toContain('2. Alternative');
 });

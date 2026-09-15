@@ -258,6 +258,24 @@ describe('PoE2 budget allocation', () => {
 });
 
 describe('PoE2 native budget evidence', () => {
+  it('defers equipment whose combined native requirements fail despite valid individual results', async () => {
+    const m = market({ 'Selected Unique': [listing('first', 2)], 'Second Ring': [listing('second', 3, 'exalted', 'Second Ring')] });
+    const source = evidence(); source.source = 'live';
+    const preservation = { xmlUnchanged: true, statsUnchanged: true, selectionsUnchanged: true, undoUnchanged: true,
+      catalogUnchanged: true, treeUnchanged: true, cacheUnchanged: true };
+    const service = new BudgetBuildService({ ...m.dependencies, evaluateItemCandidates: async request => request.combined
+      ? { outcomes: [], failures: [], combined: { entryIds: request.candidates.map(candidate => candidate.entryId), before: { Life: 2100 },
+          after: { Life: 2400 }, valid: false, warnings: ['Insufficient Int'], checkedAt: '2026-09-15T20:00:00Z', conditions: {}, preservation } }
+      : { failures: [], outcomes: request.candidates.map(candidate => ({ snapshotId: request.snapshotId, entryId: candidate.entryId,
+          listingId: candidate.quote.listingId, candidateFingerprint: candidate.candidateFingerprint, engine: 'PoB2' as const,
+          checkedAt: '2026-09-15T20:00:00Z', valid: true, before: { Life: 2100 }, after: { Life: 2200 },
+          conditions: { calculationMode: 'CALCULATOR' }, rollback: preservation })) } });
+    const plan = await service.createPlan(source, 'Fixture', options, { expectedXml: xml, expectedBuildName: 'Fixture' });
+    expect(plan.entries.every(entry => entry.decision === 'defer')).toBe(true);
+    expect(plan.budget).toMatchObject({ quotedSpend: 0, remaining: 10, proposed: 0 });
+    expect(plan.combinedNative?.valid).toBe(false);
+  });
+
   it('uses unsaved matching native selections and outputs through read-only calls', async () => {
     const fixture = context();
     const unsaved = xml.replace('Selected Unique', 'Unsaved Unique');
@@ -302,21 +320,21 @@ describe('PoE2 native budget evidence', () => {
       before: { Life: 2100 }, after: { Life: 2200 + index * 100 }, conditions: { enemy: 'fixture' },
       rollback: { xmlUnchanged: true, statsUnchanged: true, selectionsUnchanged: true, undoUnchanged: true },
     }));
-    const service = new BudgetBuildService({ ...m.dependencies, budgetNativeOutcomes: native });
-    const plan = await service.createPlan(source, 'Fixture', options);
+    const service = new BudgetBuildService({ ...m.dependencies, evaluateItemCandidates: async () => ({ outcomes: native, failures: [] }) });
+    const plan = await service.createPlan(source, 'Fixture', options, { expectedXml: xml, expectedBuildName: 'Fixture' });
     expect(plan.entries[0].native?.deltas.Life).toMatchObject({ before: 2100, after: 2200, absolute: 100 });
     expect(plan.entries[1].native?.deltas.Life.absolute).toBe(200);
     expect(plan.snapshot.stats.Life).toBe(2100);
     expect(plan.warnings.join(' ')).toMatch(/cannot be summed/);
     firstListing.item.explicitMods!.push('+5 to maximum Life');
-    const changedItem = await service.createPlan(source, 'Fixture', options);
+    const changedItem = await service.createPlan(source, 'Fixture', options, { expectedXml: xml, expectedBuildName: 'Fixture' });
     expect(changedItem.entries[0].native).toBeUndefined();
     firstListing.item.explicitMods!.pop();
     source.stats.Life = 2000;
-    const stale = await service.createPlan(source, 'Fixture', options);
+    const stale = await service.createPlan(source, 'Fixture', options, { expectedXml: xml, expectedBuildName: 'Fixture' });
     expect(stale.entries.every(entry => entry.native === undefined)).toBe(true);
     source.stats.Life = 2100; native[0].rollback.xmlUnchanged = false;
-    const unsafe = await service.createPlan(source, 'Fixture', options);
+    const unsafe = await service.createPlan(source, 'Fixture', options, { expectedXml: xml, expectedBuildName: 'Fixture' });
     expect(unsafe.entries[0].decision).toBe('defer');
     expect(unsafe.shopping.items[0].warnings.join(' ')).toMatch(/rollback/);
   });

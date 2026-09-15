@@ -4,6 +4,7 @@ import { EventEmitter } from "events";
 import path from "path";
 import os from "os";
 import { XMLParser, XMLValidator } from "fast-xml-parser";
+import type { NativeItemEvaluationRequest, NativeItemEvaluation } from './types/nativeItemTypes.js';
 
 /** Lua bridge request envelope */
 type LuaRequest = { action: string; params?: Record<string, unknown> };
@@ -463,10 +464,17 @@ abstract class PoBApiBase {
     };
   }
 
-  async calcWith(params: { addNodes?: number[]; removeNodes?: number[]; masteryEffects?: Record<string | number, number>; useFullDPS?: boolean }): Promise<any> {
+  async calcWith(params: { expectedBuildName?: string; expectedXml?: string; addNodes?: number[]; removeNodes?: number[]; masteryEffects?: Record<string | number, number>; weaponSet?: 1 | 2; weaponSets?: Record<string | number, number>; attributeOverrides?: Record<string | number, 'str' | 'dex' | 'int'>; useFullDPS?: boolean }): Promise<any> {
     const res = await this.send({ action: "calc_with", params });
     if (!res.ok) throw new Error(res.error || "calc_with failed");
     return res.output;
+  }
+
+  /** Native item comparisons on detached calculation state; the open build stays unchanged. */
+  async evaluateItemReplacements(params: NativeItemEvaluationRequest): Promise<NativeItemEvaluation> {
+    const response = await this.send({ action: 'evaluate_item_replacements', params: { ...params } }, Math.max(this.getTimeoutMs(), 60000));
+    if (!response.ok) throw new Error(response.error || 'evaluate_item_replacements failed');
+    return response.result as NativeItemEvaluation;
   }
 
   async evaluateAnointCandidates(params: { slot: string; focus?: "dps" | "defence" | "both"; limit?: number }): Promise<{

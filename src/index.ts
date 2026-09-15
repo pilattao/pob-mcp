@@ -22,6 +22,7 @@ import { SkillGemService } from "./services/skillGemService.js";
 import { TradeApiClient } from "./services/tradeClient.js";
 import { StatMapper } from "./services/statMapper.js";
 import { PoeNinjaClient } from "./services/poeNinjaClient.js";
+import { PoE2BulkExchangeClient } from "./services/poe2ExchangeQuotes.js";
 import { ItemRecommendationEngine } from "./services/itemRecommendationEngine.js";
 
 // Import types
@@ -57,6 +58,7 @@ class PoBMCPServer {
   private statMapper: StatMapper | null = null;
   private recommendationEngine: ItemRecommendationEngine | null = null;
   private ninjaClient: PoeNinjaClient;
+  private exchangeClient?: PoE2BulkExchangeClient;
 
   // Context builder
   private contextBuilder: ContextBuilder;
@@ -114,6 +116,7 @@ class PoBMCPServer {
         requestsPerSecond,
         cacheTTL,
       });
+      if (this.ninjaClient.game === 'poe2') this.exchangeClient = new PoE2BulkExchangeClient();
       this.statMapper = new StatMapper();
       this.recommendationEngine = new ItemRecommendationEngine(this.tradeClient, this.statMapper, this.ninjaClient);
       console.error('[Trade API] Enabled with rate limit:', requestsPerSecond, 'req/s');
@@ -312,6 +315,7 @@ class PoBMCPServer {
           statMapper: this.statMapper,
           recommendationEngine: this.recommendationEngine,
           ninjaClient: this.ninjaClient,
+          exchangeClient: this.exchangeClient,
           getLuaClient: () => this.luaClientManager.getClient(),
           ensureLuaClient: () => this.luaClientManager.ensureClient(),
         };

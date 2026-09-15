@@ -11,6 +11,9 @@ import { ShoppingListService, type ShoppingDependencies, type ShoppingList, type
 import type { TradeApiClient } from './tradeClient.js';
 import type { StatMapper } from './statMapper.js';
 import type { PoeNinjaClient } from './poeNinjaClient.js';
+import type { ItemListing } from '../types/tradeTypes.js';
+import { createBudgetItemEvaluator, type BudgetItemEvaluator, type BudgetItemCandidate,
+  type BudgetItemEvaluationRequest, type BudgetItemEvaluationResult } from './budgetItemEvaluator.js';
 
 export interface BudgetBuildOptions {
   budgetTier?: string;
@@ -26,6 +29,9 @@ export interface BudgetBuildOptions {
   maxPricePerItem?: number;
   limitPerSlot?: number;
   maxSearches?: number;
+  compareItems?: boolean;
+  maxNativeCandidates?: number;
+  nativeMetric?: 'CombinedDPS' | 'TotalDPS' | 'FullDPS' | 'TotalEHP' | 'Life' | 'EnergyShield';
 }
 
 /** Trusted calculator integration evidence, not public tool arguments or item-stat estimates.
@@ -51,8 +57,8 @@ export interface BudgetBuildDependencies {
   ninjaClient?: PoeNinjaClient;
   skillGemService?: Pick<SkillGemService, 'prepareBuild'>;
   shoppingDependencies?: ShoppingDependencies;
-  /** Already calculated by the native adapter; budget planning itself does not mutate PoB. */
-  budgetNativeOutcomes?: readonly BudgetNativeOutcome[];
+  /** Trusted native evaluator callback. Never populated from public result objects. */
+  evaluateItemCandidates?: BudgetItemEvaluator;
 }
 export interface BudgetBuildContext extends EvidenceContext, BudgetBuildDependencies {}
 type BudgetGem = Omit<SkillGem, 'data'> & { naturalMaxLevel?: number; metadataSource?: string };
@@ -75,7 +81,7 @@ export interface BudgetEntry {
   candidate?: ShoppingCandidate;
   candidateFingerprint?: string;
   native?: { checkedAt: string; conditions: Record<string, unknown>;
-    deltas: Record<string, { before: number; after: number; absolute: number; percent?: number }> };
+    deltas: Record<string, { before: number; after: number; absolute: number; percent?: number; gainPerCurrency?: number }> };
 }
 export interface BudgetBuildPlan {
   mode: 'read-only-proposal';
@@ -89,6 +95,7 @@ export interface BudgetBuildPlan {
     runes: ShoppingList['runes']; charms: ShoppingList['charms'] };
   shopping: ShoppingList;
   entries: BudgetEntry[];
+  combinedNative?: BudgetItemEvaluationResult['combined'];
   warnings: string[];
 }
 
@@ -124,6 +131,8 @@ function validateOptions(options: BudgetBuildOptions): void {
   if (options.currency !== undefined && (typeof options.currency !== 'string' || !options.currency.trim())) throw new Error('Currency must be non-empty');
   if (options.budget !== undefined && !options.currency) throw new Error('A numeric budget requires an explicit currency');
   if (options.league !== undefined && typeof options.league !== 'string') throw new Error('League must be a string');
+  if (options.maxNativeCandidates !== undefined && (!Number.isInteger(options.maxNativeCandidates) || options.maxNativeCandidates < 1 || options.maxNativeCandidates > 12)) throw new Error('maxNativeCandidates must be from 1 to 12');
+  if (options.nativeMetric !== undefined && !['CombinedDPS', 'TotalDPS', 'FullDPS', 'TotalEHP', 'Life', 'EnergyShield'].includes(options.nativeMetric)) throw new Error('Unknown native comparison metric');
 }
 
 /** Include both weapon specialisations in the retained loadout, even when only one is searched. */
@@ -180,7 +189,20 @@ export class BudgetBuildService {
     const league = options.league?.trim() ?? '';
     const service = this.dependencies.skillGemService ?? this.dependencies.shoppingDependencies?.skillGemService ?? new SkillGemService();
     const model = await service.prepareBuild(build, gemOptions);
-    const shopping = await new ShoppingListService(this.dependencies.tradeClient, this.dependencies.statMapper, this.dependencies.ninjaClient, {
+    // Preserve the complete fetched trade record for conversion. ShoppingCandidate intentionally
+    // contains only a summary; rebuilding an item from that summary would lose modifiers/runes.
+    const fullListings = new Map<string, ItemListing>();
+    const trade = this.dependencies.tradeClient;
+    const trackedTrade = trade && new Proxy(trade, { get(target, key) {
+      if (key === 'fetchItems') return async (ids: string[], queryId?: string) => {
+        const listings = await target.fetchItems(ids, queryId);
+        for (const listing of listings) fullListings.set(`${queryId}:${listing.id}`, structuredClone(listing));
+        return listings;
+      };
+      const member = Reflect.get(target, key, target);
+      return typeof member === 'function' ? member.bind(target) : member;
+    } });
+    const shopping = await new ShoppingListService(trackedTrade, this.dependencies.statMapper, this.dependencies.ninjaClient, {
       ...this.dependencies.shoppingDependencies, skillGemService: { prepareBuild: async () => model },
     }).generateShoppingList(build, buildName, league, ['endgame', 'high'].includes(tier) ? 'endgame' : tier === 'medium' ? 'medium' : 'budget', {
       ...options, currency, stats: evidence.stats, source: evidence.source, sourceNote: evidence.note, gemOptions,
@@ -194,15 +216,51 @@ export class BudgetBuildService {
       'Proposed replacements require a combined native calculation before use. Individual replacement outcomes cannot be summed into a completed-build result.'];
     if (options.budget === undefined) warnings.push('Provide a numeric budget and currency to allocate purchases. Budget tiers do not imply a spending limit.');
     if (!this.dependencies.tradeClient) warnings.push('Market client is not connected; exact requirements and retained loadout are available, but no live listings were fetched.');
-    if (this.dependencies.budgetNativeOutcomes?.some(outcome => outcome.snapshotId !== snapshotId)) {
-      warnings.push('Native results from different build snapshots were excluded.');
-    }
+    const evaluateItems = options.compareItems === false ? undefined : this.dependencies.evaluateItemCandidates;
+    const nativeSources: BudgetItemCandidate[] = [];
+    const nativeFailures: BudgetItemEvaluationResult['failures'] = [];
+    let nativeOutcomes: BudgetNativeOutcome[] = [];
+    const nativeRequest: Omit<BudgetItemEvaluationRequest, 'candidates'> | undefined = evidence.source === 'live' && gemOptions.expectedXml
+      ? { snapshotId, expectedXml: gemOptions.expectedXml, expectedBuildName: gemOptions.expectedBuildName ?? buildName,
+        itemSetId: shopping.selection.itemSetId ?? '', skillSetId: shopping.selection.skillSetId } : undefined;
+    if (evaluateItems && nativeRequest && options.budget !== 0) {
+      for (const row of shopping.items.filter(row => row.kind === 'equipment' || row.kind === 'charm')) {
+        for (const quote of row.candidates) {
+          if (nativeSources.length >= (options.maxNativeCandidates ?? 12)) break;
+          const listing = fullListings.get(`${quote.source.queryId}:${quote.listingId}`);
+          if (!listing) { nativeFailures.push({ entryId: row.id, listingId: quote.listingId, reason: 'Complete fetched trade item is unavailable; native conversion was not attempted.' }); continue; }
+          nativeSources.push({ entryId: row.id, slot: row.slot, quote, listing, candidateFingerprint: candidateFingerprint(row, quote) });
+        }
+      }
+      if (nativeSources.length) {
+        try {
+          const calculated = await evaluateItems({ ...nativeRequest, candidates: nativeSources });
+          nativeOutcomes = calculated.outcomes;
+          nativeFailures.push(...calculated.failures);
+          for (const candidate of nativeSources) if (!nativeOutcomes.some(outcome => outcome.snapshotId === snapshotId && outcome.entryId === candidate.entryId && outcome.listingId === candidate.quote.listingId)) {
+            if (!nativeFailures.some(failure => failure.entryId === candidate.entryId && failure.listingId === candidate.quote.listingId)) nativeFailures.push({ entryId: candidate.entryId, listingId: candidate.quote.listingId, reason: 'No native result matched this build snapshot and item.' });
+          }
+        } catch (error) {
+          for (const candidate of nativeSources) nativeFailures.push({ entryId: candidate.entryId, listingId: candidate.quote.listingId,
+            reason: `Native comparison failed: ${error instanceof Error ? error.message : String(error)}` });
+        }
+      }
+    } else if (evaluateItems && !nativeRequest) warnings.push('Exact current native XML is unavailable; native item comparisons were not attempted for this saved snapshot.');
+    for (const failure of nativeFailures) shopping.items.find(row => row.id === failure.entryId)?.warnings.push(`${failure.listingId}: ${failure.reason}`);
+    const metricGain = (row: ShoppingListItem, quote: ShoppingCandidate, price: number) => {
+      const native = nativeOutcomes.find(outcome => outcome.entryId === row.id && outcome.listingId === quote.listingId && outcome.snapshotId === snapshotId && outcome.valid);
+      const metric = options.nativeMetric;
+      if (!metric || !native || !Number.isFinite(native.before[metric]) || !Number.isFinite(native.after[metric])) return -Infinity;
+      const gain = (native.after[metric] - native.before[metric]) / price;
+      return Number.isFinite(gain) ? gain : -Infinity;
+    };
     const used = new Set<string>();
     const entries: BudgetEntry[] = [];
     const prices = new Map(shopping.items.map(row => [row.id, row.candidates
       .map(candidate => ({ candidate, price: comparablePrice(candidate, league, currency) }))
       .filter((q): q is { candidate: ShoppingCandidate; price: number } => q.price !== undefined)
-      .sort((a, b) => a.price - b.price || a.candidate.listingId.localeCompare(b.candidate.listingId))]));
+      .sort((a, b) => (options.nativeMetric ? metricGain(row, b.candidate, b.price) - metricGain(row, a.candidate, a.price) : 0) ||
+        a.price - b.price || a.candidate.listingId.localeCompare(b.candidate.listingId))]));
     const moneyExponent = Math.min(0, decimal(options.budget ?? 0).exponent,
       ...[...prices.values()].flatMap(rows => rows.map(row => decimal(row.price).exponent)));
     const units = (value: number) => {
@@ -221,8 +279,10 @@ export class BudgetBuildService {
       else {
         for (const quote of quoted) {
           if (used.has(quote.candidate.listingId)) continue;
+          if (nativeFailures.some(failure => failure.entryId === row.id && failure.listingId === quote.candidate.listingId)) continue;
+          if (options.nativeMetric && ['equipment', 'charm'].includes(row.kind) && metricGain(row, quote.candidate, quote.price) <= 0) continue;
           if (units(quote.price) > allowance - spent || (options.maxPricePerItem !== undefined && quote.price > options.maxPricePerItem)) continue;
-          const outcomes = this.dependencies.budgetNativeOutcomes?.filter(outcome => outcome.snapshotId === snapshotId &&
+          const outcomes = nativeOutcomes.filter(outcome => outcome.snapshotId === snapshotId &&
             outcome.entryId === row.id && outcome.listingId === quote.candidate.listingId) ?? [];
           const fingerprint = candidateFingerprint(row, quote.candidate);
           let native: BudgetEntry['native'];
@@ -234,15 +294,18 @@ export class BudgetBuildService {
             if (!verified) { row.warnings.push(`Native evidence for ${quote.candidate.listingId} is ambiguous or rollback is unverified.`); continue; }
             if (outcome.candidateFingerprint !== fingerprint) { row.warnings.push(`Native item/target evidence for ${quote.candidate.listingId} is stale.`); continue; }
             if (outcome.valid !== true) { row.warnings.push(`Native calculation rejected candidate ${quote.candidate.listingId}.`); continue; }
-            const keys = Object.keys(outcome.before ?? {});
-            if (!keys.length || keys.some(key => stats[key] === undefined || outcome.before[key] !== stats[key] ||
+            const keys = outputFields.filter(key => Number.isFinite(outcome.before?.[key]));
+            if (!keys.length || keys.some(key =>
+              (outcome.conditions.calculationMode !== 'CALCULATOR' && (stats[key] === undefined || outcome.before[key] !== stats[key])) ||
               !Number.isFinite(outcome.after?.[key]) || !Number.isFinite(outcome.after[key] - outcome.before[key]))) {
               row.warnings.push(`Native baseline for ${quote.candidate.listingId} does not match the observed outputs.`); continue;
             }
             native = { checkedAt: outcome.checkedAt, conditions: outcome.conditions, deltas: Object.fromEntries(keys.map(key => {
               const before = outcome.before[key], after = outcome.after[key], absolute = after - before;
-              const percent = before === 0 ? undefined : absolute / before * 100;
-              return [key, { before, after, absolute, ...(percent !== undefined && Number.isFinite(percent) ? { percent } : {}) }];
+              const percent = before === 0 ? undefined : absolute / Math.abs(before) * 100;
+              const gainPerCurrency = absolute / quote.price;
+              return [key, { before, after, absolute, ...(Number.isFinite(gainPerCurrency) ? { gainPerCurrency } : {}),
+                ...(percent !== undefined && Number.isFinite(percent) ? { percent } : {}) }];
             })) };
           }
           used.add(quote.candidate.listingId); spent += units(quote.price);
@@ -258,14 +321,38 @@ export class BudgetBuildService {
     }
     const main = groups.find(group => group.isMainSkill);
     if (!main) warnings.push('The saved/native evidence does not identify a main skill group; no first-group fallback was selected.');
-    const proposed = entries.filter(row => row.decision === 'propose').length;
+    let proposed = entries.filter(row => row.decision === 'propose').length;
+    let combinedNative: BudgetItemEvaluationResult['combined'];
+    const equipmentEntries = entries.filter(row => row.decision === 'propose' && ['equipment', 'charm'].includes(row.kind));
+    if (evaluateItems && nativeRequest && equipmentEntries.length && equipmentEntries.length <= 12) {
+      const selected = equipmentEntries.map(row => nativeSources.find(candidate => candidate.entryId === row.id && candidate.quote.listingId === row.candidate?.listingId));
+      if (selected.every((source): source is BudgetItemCandidate => source !== undefined)) {
+        try {
+          const together = await evaluateItems({ ...nativeRequest, candidates: selected, combined: true });
+          combinedNative = together.combined;
+          warnings.push(...together.failures.map(failure => `Combined native equipment comparison: ${failure.reason}`));
+        } catch (error) { warnings.push(`Combined native equipment comparison failed: ${error instanceof Error ? error.message : String(error)}`); }
+      }
+    }
+    if (options.nativeMetric) warnings.push(`Equipment alternatives are ordered by measured ${options.nativeMetric} gain per ${currency ?? 'budget currency'}; only positive verified gains are proposed. Joint effects are calculated separately.`);
+    const jointMetric = options.nativeMetric;
+    const jointImproves = !jointMetric || !combinedNative || combinedNative.after[jointMetric] > combinedNative.before[jointMetric];
+    if (combinedNative && (!combinedNative.valid || !jointImproves)) {
+      for (const entry of equipmentEntries) {
+        spent -= units(entry.candidate!.priceInBudgetCurrency!);
+        entry.decision = 'defer'; entry.reason = 'The combined native equipment result fails requirements or the requested improvement; retain the current loadout.';
+        delete entry.candidate; delete entry.candidateFingerprint;
+      }
+      proposed = entries.filter(row => row.decision === 'propose').length;
+      warnings.push('The tested equipment combination was deferred. Its actual native result is retained for diagnosis; no equipment purchase allowance was allocated to it.');
+    }
     return { mode: 'read-only-proposal', buildName,
       snapshot: { id: snapshotId, source: evidence.source, note: evidence.note,
         character: { className: build.Build?.className, ascendancy: build.Build?.ascendClassName, level: finiteNumber(build.Build?.level) }, stats },
       budget: { tier, scope: 'additional-purchases', limit: options.budget, currency,
         ...(options.budget !== undefined ? { quotedSpend: value(spent), remaining: value(allowance - spent) } : {}), proposed, deferred: entries.length - proposed },
       loadout: { selection: shopping.selection, equipment: equipment(build, shopping.selection), groups,
-        mainGroupIndex: main?.index, runes: shopping.runes, charms: shopping.charms }, shopping, entries, warnings };
+        mainGroupIndex: main?.index, runes: shopping.runes, charms: shopping.charms }, shopping, entries, combinedNative, warnings };
   }
 }
 
@@ -278,7 +365,14 @@ export async function createBudgetBuildPlan(context: BudgetBuildContext, buildNa
   const displayName = buildName ?? (evidence.source === 'live' && client ? (await client.getBuildInfo()).name : undefined) ?? 'Current PoB2 build';
   const gemOptions: GemReadOptions = evidence.source === 'live' && client
     ? { client, source: 'live', liveSkills: await client.getSkills() } : { source: 'file' };
-  const plan = await new BudgetBuildService(context).createPlan(evidence, displayName, options, gemOptions);
+  if (evidence.source === 'live' && client) {
+    gemOptions.expectedXml = await client.exportBuildXml();
+    gemOptions.expectedBuildName = (await client.getBuildInfo()).name ?? displayName;
+    if (JSON.stringify(context.buildService.parseBuildContent(gemOptions.expectedXml)) !== JSON.stringify(evidence.build)) throw new Error('Native build changed before budget comparison; retry the read');
+  }
+  const evaluateItemCandidates = context.evaluateItemCandidates ?? (evidence.source === 'live' && client && typeof client.evaluateItemReplacements === 'function'
+    ? createBudgetItemEvaluator(client) : undefined);
+  const plan = await new BudgetBuildService({ ...context, evaluateItemCandidates }).createPlan(evidence, displayName, options, gemOptions);
   if (evidence.source === 'live' && client) {
     const after = context.buildService.parseBuildContent(await client.exportBuildXml());
     if (JSON.stringify(after) !== JSON.stringify(evidence.build)) throw new Error('Native build changed during budget planning; retry the read');
@@ -320,6 +414,10 @@ export function formatBudgetBuildPlan(plan: BudgetBuildPlan): string {
   }
   if (loadout.runes.length) lines.push('', '## Rune evidence', ...loadout.runes.flatMap(rune => [
     `${rune.slot}: ${rune.occupied.join(', ') || 'none observed'}; capacity ${rune.capacity ?? 'unknown'}; empty ${rune.empty ?? 'unknown'}`, ...rune.warnings]));
+  if (plan.combinedNative) lines.push('', '## Native calculation for the tested equipment combination',
+    `Covered entries: ${plan.combinedNative.entryIds.join(', ')}; requirements valid: ${plan.combinedNative.valid}; checked ${plan.combinedNative.checkedAt}`,
+    `Native baseline: ${JSON.stringify(knownOutputs(plan.combinedNative.before))}`, `Native equipment result: ${JSON.stringify(knownOutputs(plan.combinedNative.after))}`,
+    `Conditions: ${JSON.stringify(plan.combinedNative.conditions)}`, ...plan.combinedNative.warnings);
   lines.push(`Charm capacity: ${loadout.charms.capacity ?? 'unknown'} (${loadout.charms.capacitySource}); equipped: ${loadout.charms.equipped}`, ...loadout.charms.warnings,
     '', ...plan.warnings, 'No build file or native runtime state was changed.');
   return lines.join('\n');

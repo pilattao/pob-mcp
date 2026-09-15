@@ -2,6 +2,7 @@ import type { BuildService } from './buildService.js';
 import type { AnyLuaClient } from '../pobLuaBridge.js';
 import type { PoBBuild } from '../types.js';
 import { validationStat } from './passiveBudget.js';
+import { nativeBuildMatches } from './nativeBuildIdentity.js';
 
 export interface EvidenceContext {
   buildService: BuildService;
@@ -32,7 +33,6 @@ const derivedValidationFields = [
   'LifeRegenRecovery','LifeLeechGainRate','EnergyShieldRegenRecovery','EnergyShieldLeechGainRate',
   'EnergyShieldRecharge','ManaRegenRecovery','DeflectChance','CharmLimit',
 ];
-const identity = (name: string) => name.replace(/\\/g, '/').replace(/\.xml$/i, '').toLowerCase();
 
 /** Read selected live state or one requested file; this function never opens/reloads/saves builds. */
 export async function readPoe2BuildEvidence(context: EvidenceContext, buildName?: string): Promise<PoE2BuildEvidence> {
@@ -53,14 +53,14 @@ export async function readPoe2BuildEvidence(context: EvidenceContext, buildName?
   if (client) {
     try { info = await client.getBuildInfo(); } catch { /* File evidence stays independent. */ }
   }
-  const matches = !buildName || (typeof info?.name === 'string' && identity(info.name) === identity(buildName));
+  const matches = nativeBuildMatches(buildName, info, context.buildService);
   if (client && info && matches) {
     try {
       const build = context.buildService.parseBuildContent(await client.exportBuildXml());
       check(build);
       const stats = { ...await client.getStats(), ...await client.getStats(derivedValidationFields) };
       const after = await client.getBuildInfo();
-      if (after?.name !== info.name || after?.className !== info.className || after?.level !== info.level) {
+      if (after?.name !== info.name || after?.className !== info.className || after?.level !== info.level || after?.fileName !== info.fileName) {
         throw new Error('Active build changed while collecting evidence; retry the read');
       }
       return { build, stats, source: 'live', note: 'Source: current PoB2 XML and native calculated outputs, including unsaved selections.' };

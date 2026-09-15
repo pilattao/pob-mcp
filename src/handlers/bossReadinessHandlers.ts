@@ -1,7 +1,12 @@
 import type { AnyLuaClient } from "../pobLuaBridge.js";
 import { wrapHandler } from "../utils/errorHandling.js";
+import { BuildService } from '../services/buildService.js';
+import { readPoe2BuildEvidence } from '../services/poe2BuildEvidence.js';
+import { analyzePoe2Defenses, formatPoe2DefensiveAnalysis, POE2_DEFENSE_FIELDS } from '../defensiveAnalyzer.js';
+import { assessBossBenchmarks, loadPoe2BossCatalog, resolvePoe2Boss, type BossReadinessOptions } from '../services/poe2BossReadiness.js';
 
 export interface BossReadinessContext {
+  buildService?: BuildService;
   getLuaClient: () => AnyLuaClient | null;
   ensureLuaClient: () => Promise<void>;
 }
@@ -76,8 +81,41 @@ const BOSS_ALIASES: Record<string, string> = {
   'generic': 'pinnacle',
 };
 
-export async function handleCheckBossReadiness(context: BossReadinessContext, boss: string) {
+export async function handleCheckBossReadiness(context: BossReadinessContext, boss: string, options: BossReadinessOptions = {}) {
   return wrapHandler('check boss readiness', async () => {
+  if ((process.env.POE_GAME ?? 'poe2') === 'poe2') {
+    const catalog=loadPoe2BossCatalog(),target=resolvePoe2Boss(boss,catalog);
+    // Validate before custom stat names reach the native API.
+    assessBossBenchmarks({},options.requirements ?? []);
+    const fields=[...new Set([...POE2_DEFENSE_FIELDS,'TotalDPS','CombinedDPS','FullDPS','MinionCombinedDPS','LifeCost','ManaCost','WardCost','ReqStr','ReqDex','ReqInt','Str','Dex','Int',...(options.requirements ?? []).map(r=>r.stat)])];
+    const buildService=context.buildService ?? new BuildService(process.env.POB_DIRECTORY ?? '');
+    const evidence=await readPoe2BuildEvidence({...context,buildService,getLuaClient:()=>{
+      const client=context.getLuaClient();if (!client) return null;
+      return new Proxy(client,{get(target,property){
+        if (property==='getStats') return (requested?:string[])=>target.getStats(requested ?? fields);
+        const value=Reflect.get(target,property,target);return typeof value==='function'?value.bind(target):value;
+      }});
+    }},options.build_name);
+    if (evidence.source==='live') {
+      const after=await context.getLuaClient()!.exportBuildXml();
+      if (JSON.stringify(buildService.parseBuildContent(after))!==JSON.stringify(evidence.build)) throw new Error('Build changed during boss assessment; retry the read');
+    }
+    const benchmarks=assessBossBenchmarks(evidence.stats,options.requirements ?? []);
+    const defenses=analyzePoe2Defenses(evidence.stats,evidence.build);
+    const lines=[`=== PoE2 Boss Preparation: ${target.name} ===`,evidence.note,
+      'Encounter completion: not established by this stat report.',
+      `Native identity source: ${catalog.source.path}; SHA256 ${catalog.source.sha256}`,
+      `Areas: ${target.areas.map(a=>`${a.name} (${a.id}, base area level ${a.baseAreaLevel ?? 'unknown'})`).join('; ')}`,
+      'Base area levels do not establish the actual encounter level, difficulty or modifiers.',
+      'Current PoB2 outputs below use the existing configuration; no boss attack profile, enemy resistance or difficulty was substituted.',
+      `Caller-defined benchmark status: ${benchmarks.status}`];
+    for (const check of benchmarks.checks) lines.push(`${check.stat}: ${check.value ?? 'unknown'}; min ${check.min ?? 'not specified'}, max ${check.max ?? 'not specified'}; ${check.status}`);
+    if (!benchmarks.checks.length) lines.push('No numerical encounter benchmarks were supplied. No fixed Life, ES or DPS minimum is assumed.');
+    lines.push('',formatPoe2DefensiveAnalysis(defenses),
+      'Damage outputs for the selected skill/configuration: '+JSON.stringify(Object.fromEntries(['TotalDPS','CombinedDPS','FullDPS','MinionCombinedDPS'].filter(k=>evidence.stats[k]!==undefined).map(k=>[k,evidence.stats[k]]))),
+      'Still unmeasured: boss-specific damage and phases, actual damage uptime, movement, ailments and recovery under sustained encounter pressure.');
+    return {content:[{type:'text' as const,text:lines.join('\n')}],structuredContent:{game:'poe2',boss:target,source:catalog.source,benchmarks,defenses}};
+  }
   await context.ensureLuaClient();
   const luaClient = context.getLuaClient();
   if (!luaClient) throw new Error('Lua bridge not active. Use lua_load_build first.');

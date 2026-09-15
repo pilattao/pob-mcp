@@ -28,16 +28,16 @@ function makeContext(overrides: Partial<{
 }
 
 describe('handleStartWatching', () => {
-  it('starts watching and reports the directory', () => {
+  it('starts watching and reports the directory', async () => {
     const ctx = makeContext({ isWatchEnabled: false, directory: '/my/builds' });
-    const result = handleStartWatching(ctx);
+    const result = await handleStartWatching(ctx);
     expect(ctx.watchService.startWatching).toHaveBeenCalled();
     expect(result.content[0].text).toContain('/my/builds');
   });
 
-  it('reports already-enabled when watching is active', () => {
+  it('reports already-enabled when watching is active', async () => {
     const ctx = makeContext({ isWatchEnabled: true });
-    const result = handleStartWatching(ctx);
+    const result = await handleStartWatching(ctx);
     expect(ctx.watchService.startWatching).not.toHaveBeenCalled();
     expect(result.content[0].text).toContain('already enabled');
   });
@@ -54,7 +54,7 @@ describe('handleStopWatching', () => {
   it('reports not-watching when already inactive', async () => {
     const ctx = makeContext({ isWatchEnabled: false });
     const result = await handleStopWatching(ctx);
-    expect(ctx.watchService.stopWatching).not.toHaveBeenCalled();
+    expect(ctx.watchService.stopWatching).toHaveBeenCalled();
     expect(result.content[0].text).toContain('not currently enabled');
   });
 });
@@ -96,5 +96,12 @@ describe('handleWatchStatus', () => {
     const ctx = makeContext({ isWatchEnabled: false });
     const result = handleWatchStatus(ctx);
     expect(result.content[0].text).toMatch(/not.*active|inactive|disabled/i);
+  });
+
+  it('shows the last filesystem failure without presenting the watcher as active', () => {
+    const ctx = makeContext({ isWatchEnabled: false });
+    ctx.watchService.getLastError = () => 'synthetic read error';
+    const text = handleWatchStatus(ctx).content[0].text;
+    expect(text).toContain('DISABLED'); expect(text).toContain('synthetic read error');
   });
 });

@@ -1,219 +1,120 @@
-import { describe, it, expect, jest, beforeEach, afterEach } from '@jest/globals';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
+import { EventEmitter } from 'events';
+import chokidar from 'chokidar';
 import { WatchService } from '../src/services/watchService';
 import { BuildService } from '../src/services/buildService';
 
-// Mock BuildService
-jest.mock('../src/services/buildService');
-
-describe('WatchService', () => {
-  let watchService: WatchService;
-  let mockBuildService: jest.Mocked<BuildService>;
-  const testDirectory = '/test/pob/directory';
-
-  beforeEach(() => {
-    mockBuildService = new BuildService(testDirectory) as jest.Mocked<BuildService>;
-    mockBuildService.invalidateBuild = jest.fn();
-    watchService = new WatchService(testDirectory, mockBuildService);
+jest.mock('chokidar', () => ({ __esModule: true, default: { watch: jest.fn() } }));
+let root: string, service: WatchService, builds: BuildService;
+let events: EventEmitter & { close: jest.Mock }, autoReady: boolean;
+const watch = jest.mocked(chokidar.watch);
+const until = async (condition: () => boolean) => {
+  for (let i = 0; !condition(); i++) {
+    if (i > 100) throw new Error('Watcher did not initialize');
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+};
+beforeEach(async () => {
+  root = await fs.mkdtemp(path.join(os.tmpdir(), 'poe2-watch-lifecycle-'));
+  builds = new BuildService(root);
+  service = new WatchService(root, builds);
+  events = Object.assign(new EventEmitter(), { close: jest.fn().mockResolvedValue(undefined) });
+  autoReady = true;
+  watch.mockReset().mockImplementation(() => {
+    if (autoReady) setImmediate(() => events.emit('ready'));
+    return events as unknown as ReturnType<typeof chokidar.watch>;
   });
+});
+afterEach(async () => { await service.stopWatching(); jest.useRealTimers(); jest.restoreAllMocks(); await fs.rm(root, { recursive: true, force: true }); });
 
-  afterEach(async () => {
-    // Clean up any active watchers
-    await watchService.stopWatching();
-  });
+it('does not claim readiness before initial directory discovery finishes', async () => {
+  autoReady = false;
+  const start = service.startWatching();
+  await until(() => watch.mock.calls.length === 1);
+  expect(service.isWatchEnabled()).toBe(false);
+  events.emit('ready'); await start;
+  expect(service.isWatchEnabled()).toBe(true);
+});
 
-  describe('constructor', () => {
-    it('should initialize with directory and buildService', () => {
-      expect(watchService.getDirectory()).toBe(testDirectory);
-      expect(watchService.isWatchEnabled()).toBe(false);
-    });
-  });
+it('coalesces concurrent starts into one ready watcher', async () => {
+  await Promise.all([service.startWatching(), service.startWatching()]);
+  expect(watch).toHaveBeenCalledTimes(1);
+  expect(service.isWatchEnabled()).toBe(true);
+});
 
-  describe('getDirectory', () => {
-    it('should return the PoB directory', () => {
-      const result = watchService.getDirectory();
-      expect(result).toBe(testDirectory);
-    });
-  });
+it('fails a missing directory instead of reporting a successful watcher', async () => {
+  await fs.rm(root, { recursive: true });
+  await expect(service.startWatching()).rejects.toThrow(/ENOENT/);
+  expect(watch).not.toHaveBeenCalled();
+  expect(service.isWatchEnabled()).toBe(false);
+  expect(service.getLastError()).toContain('ENOENT');
+});
 
-  describe('isWatchEnabled', () => {
-    it('should return false initially', () => {
-      expect(watchService.isWatchEnabled()).toBe(false);
-    });
+it('coalesces each relative path independently and accepts uppercase XML', async () => {
+  const invalidation = jest.spyOn(builds, 'invalidateBuild');
+  await service.startWatching(); jest.useFakeTimers();
+  events.emit('change', path.join(root, 'First', 'Same.XML'));
+  events.emit('change', path.join(root, 'First', 'Same.XML'));
+  events.emit('add', path.join(root, 'Second', 'Same.XML'));
+  events.emit('change', path.join(root, 'ignore.txt'));
+  jest.advanceTimersByTime(600);
+  expect(invalidation.mock.calls.map(call => call[0])).toEqual(['First/Same.XML', 'Second/Same.XML']);
+  expect(service.getRecentChanges()).toMatchObject([{ file: 'Second/Same.XML', type: 'added' }, { file: 'First/Same.XML', type: 'modified' }]);
+});
 
-    it('should return true after starting watch', () => {
-      watchService.startWatching();
-      expect(watchService.isWatchEnabled()).toBe(true);
-    });
+it('cancels queued events on stop so no stale event invalidates a subsequent session', async () => {
+  await service.startWatching(); jest.useFakeTimers();
+  events.emit('change', path.join(root, 'build.xml'));
+  await service.stopWatching(); jest.advanceTimersByTime(1000);
+  expect(service.getRecentChangesCount()).toBe(0);
+  expect(events.close).toHaveBeenCalledTimes(1);
+});
 
-    it('should return false after stopping watch', async () => {
-      watchService.startWatching();
-      await watchService.stopWatching();
-      expect(watchService.isWatchEnabled()).toBe(false);
-    });
-  });
+it('stops a pending startup and permits an immediate fresh start', async () => {
+  autoReady = false;
+  const pending = service.startWatching();
+  const rejected = expect(pending).rejects.toThrow(/cancelled/);
+  await until(() => watch.mock.calls.length === 1);
+  await service.stopWatching();
+  autoReady = true;
+  await service.startWatching();
+  await rejected;
+  expect(service.isWatchEnabled()).toBe(true);
+});
 
-  describe('getRecentChanges', () => {
-    it('should return empty array initially', () => {
-      const changes = watchService.getRecentChanges();
-      expect(changes).toEqual([]);
-    });
+it('marks a failed active watcher disabled and exposes its error', async () => {
+  await service.startWatching();
+  events.emit('error', new Error('synthetic filesystem failure'));
+  await service.stopWatching();
+  expect(service.isWatchEnabled()).toBe(false);
+  expect(service.getLastError()).toContain('synthetic filesystem failure');
+});
 
-    it('should return changes in reverse chronological order', () => {
-      // Manually add changes by accessing private property
-      (watchService as any).recentChanges.push(
-        { file: 'build1.xml', timestamp: 1000, type: 'added' },
-        { file: 'build2.xml', timestamp: 2000, type: 'modified' },
-        { file: 'build3.xml', timestamp: 3000, type: 'deleted' }
-      );
+it('rejects startup filesystem errors without leaving an enabled watcher', async () => {
+  autoReady = false;
+  const start = service.startWatching();
+  const failure = expect(start).rejects.toThrow(/synthetic denied/);
+  await until(() => watch.mock.calls.length === 1);
+  events.emit('error', new Error('synthetic denied'));
+  await failure;
+  expect(service.isWatchEnabled()).toBe(false);
+});
 
-      const changes = watchService.getRecentChanges();
+it('keeps deletion events and a bounded newest-first history without exposing internal state', async () => {
+  await service.startWatching(); jest.useFakeTimers();
+  for (let i = 0; i < 60; i++) events.emit('unlink', path.join(root, `build-${i}.xml`));
+  jest.advanceTimersByTime(600);
+  expect(service.getRecentChangesCount()).toBe(50);
+  const changes = service.getRecentChanges(2);
+  expect(changes.map(c => c.file)).toEqual(['build-59.xml', 'build-58.xml']);
+  expect(changes[0].type).toBe('deleted');
+  changes[0].file = 'changed outside';
+  expect(service.getRecentChanges(1)[0].file).toBe('build-59.xml');
+  expect(service.getRecentChanges(0)).toEqual([]);
+});
 
-      expect(changes).toHaveLength(3);
-      expect(changes[0].file).toBe('build3.xml');
-      expect(changes[1].file).toBe('build2.xml');
-      expect(changes[2].file).toBe('build1.xml');
-    });
-
-    it('should respect limit parameter', () => {
-      // Add 15 changes
-      for (let i = 1; i <= 15; i++) {
-        (watchService as any).recentChanges.push({
-          file: `build${i}.xml`,
-          timestamp: i * 1000,
-          type: 'added'
-        });
-      }
-
-      const changes = watchService.getRecentChanges(5);
-
-      expect(changes).toHaveLength(5);
-      expect(changes[0].file).toBe('build15.xml');
-      expect(changes[4].file).toBe('build11.xml');
-    });
-
-    it('should default to 10 changes when no limit specified', () => {
-      // Add 15 changes
-      for (let i = 1; i <= 15; i++) {
-        (watchService as any).recentChanges.push({
-          file: `build${i}.xml`,
-          timestamp: i * 1000,
-          type: 'added'
-        });
-      }
-
-      const changes = watchService.getRecentChanges();
-
-      expect(changes).toHaveLength(10);
-      expect(changes[0].file).toBe('build15.xml');
-      expect(changes[9].file).toBe('build6.xml');
-    });
-  });
-
-  describe('getRecentChangesCount', () => {
-    it('should return 0 initially', () => {
-      expect(watchService.getRecentChangesCount()).toBe(0);
-    });
-
-    it('should return correct count after adding changes', () => {
-      (watchService as any).recentChanges.push(
-        { file: 'build1.xml', timestamp: 1000, type: 'added' },
-        { file: 'build2.xml', timestamp: 2000, type: 'modified' }
-      );
-
-      expect(watchService.getRecentChangesCount()).toBe(2);
-    });
-  });
-
-  describe('processFileChange (via private method access)', () => {
-    it('should invalidate build cache when file changes', () => {
-      // Access private method
-      (watchService as any).processFileChange('test.xml', 'modified');
-
-      expect(mockBuildService.invalidateBuild).toHaveBeenCalledWith('test.xml');
-    });
-
-    it('should track file changes', () => {
-      (watchService as any).processFileChange('test.xml', 'modified');
-
-      const changes = watchService.getRecentChanges();
-      expect(changes).toHaveLength(1);
-      expect(changes[0].file).toBe('test.xml');
-      expect(changes[0].type).toBe('modified');
-    });
-
-    it('should limit recent changes to 50', () => {
-      // Add 60 changes
-      for (let i = 1; i <= 60; i++) {
-        (watchService as any).processFileChange(`build${i}.xml`, 'modified');
-      }
-
-      const count = watchService.getRecentChangesCount();
-      expect(count).toBe(50);
-
-      const changes = watchService.getRecentChanges(50);
-      // Should have the most recent 50
-      expect(changes[0].file).toBe('build60.xml');
-      expect(changes[49].file).toBe('build11.xml');
-    });
-  });
-
-  describe('handleFileChange (via private method access)', () => {
-    it('should ignore non-XML files', () => {
-      (watchService as any).handleFileChange('/path/to/file.txt', 'modified');
-
-      // No changes should be tracked
-      expect(watchService.getRecentChangesCount()).toBe(0);
-      expect(mockBuildService.invalidateBuild).not.toHaveBeenCalled();
-    });
-
-    it('should process XML files', (done) => {
-      (watchService as any).handleFileChange('/path/to/build.xml', 'modified');
-
-      // Due to debouncing, wait for setTimeout
-      setTimeout(() => {
-        expect(watchService.getRecentChangesCount()).toBe(1);
-        expect(mockBuildService.invalidateBuild).toHaveBeenCalledWith('build.xml');
-        done();
-      }, 600); // Wait longer than 500ms debounce
-    });
-
-    it('should debounce rapid changes to same file', (done) => {
-      (watchService as any).handleFileChange('/path/to/build.xml', 'modified');
-      (watchService as any).handleFileChange('/path/to/build.xml', 'modified');
-      (watchService as any).handleFileChange('/path/to/build.xml', 'modified');
-
-      setTimeout(() => {
-        // Should only process once despite 3 calls
-        expect(watchService.getRecentChangesCount()).toBe(1);
-        expect(mockBuildService.invalidateBuild).toHaveBeenCalledTimes(1);
-        done();
-      }, 600);
-    });
-  });
-
-  describe('startWatching and stopWatching', () => {
-    it('should not start multiple watchers', () => {
-      watchService.startWatching();
-      const firstWatcher = (watchService as any).watcher;
-
-      watchService.startWatching();
-      const secondWatcher = (watchService as any).watcher;
-
-      expect(firstWatcher).toBe(secondWatcher);
-    });
-
-    it('should handle stopWatching when not watching', async () => {
-      // Should not throw
-      await expect(watchService.stopWatching()).resolves.not.toThrow();
-    });
-
-    it('should clean up watcher on stop', async () => {
-      watchService.startWatching();
-      expect((watchService as any).watcher).not.toBeNull();
-
-      await watchService.stopWatching();
-      expect((watchService as any).watcher).toBeNull();
-      expect(watchService.isWatchEnabled()).toBe(false);
-    });
-  });
+it.each([-1, 51, 1.5, NaN, Infinity])('rejects invalid history limit %s', limit => {
+  expect(() => service.getRecentChanges(limit)).toThrow(/limit/);
 });

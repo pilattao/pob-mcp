@@ -1,5 +1,6 @@
 import { wrapHandler } from '../utils/errorHandling.js';
 import type { AnyLuaClient } from '../pobLuaBridge.js';
+import { measurePoe2Anoints } from '../services/poe2TreeMeasurements.js';
 
 interface AnointHandlerContext {
   getLuaClient: () => AnyLuaClient | null;
@@ -20,6 +21,7 @@ export async function handleFindBestAnointment(
   args: { slot: string; focus?: 'dps' | 'defence' | 'both'; max_results?: number },
 ) {
   return wrapHandler('find best anointment', async () => {
+    if (process.env.POE_GAME === 'poe2') return measurePoe2Anoints(context,args);
     await context.ensureLuaClient();
     const client = context.getLuaClient();
     if (!client) {

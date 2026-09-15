@@ -7,6 +7,7 @@ import { analyzeDefenses, formatDefensiveAnalysis, analyzePoe2Defenses, formatPo
 import { readPoe2BuildEvidence } from "../services/poe2BuildEvidence.js";
 import { wrapHandler } from "../utils/errorHandling.js";
 import { sanitizeBuildName } from "../utils/pathSanitizer.js";
+import { planPoe2Tree, formatPoe2TreePlan, type Poe2TreeOptions } from '../services/poe2TreeOptimization.js';
 
 export interface OptimizationHandlerContext {
   buildService: BuildService;
@@ -151,11 +152,16 @@ export async function handleAnalyzeDefenses(
 
 export async function handleSuggestOptimalNodes(
   context: OptimizationHandlerContext,
-  buildName: string,
+  buildName: string | undefined,
   goalString: string,
-  pointsAvailable?: number
+  pointsAvailable?: number,
+  options?: Poe2TreeOptions
 ) {
   return wrapHandler('suggest optimal nodes', async () => {
+    if (process.env.POE_GAME === 'poe2') {
+      const data = await planPoe2Tree(context, buildName, goalString, pointsAvailable, false, 1, {}, options);
+      return {content:[{type:'text' as const,text:formatPoe2TreePlan(data)}],structuredContent:data};
+    }
     await context.ensureLuaClient();
     const luaClient = context.getLuaClient();
     if (!luaClient) throw new Error('Lua client not initialized');
@@ -315,13 +321,18 @@ export async function handleSuggestOptimalNodes(
 
 export async function handleOptimizeTree(
   context: OptimizationHandlerContext,
-  buildName: string,
+  buildName: string | undefined,
   goalString: string,
   maxPoints?: number,
   maxIterations?: number,
-  constraints?: OptimizationConstraints
+  constraints?: OptimizationConstraints,
+  options?: Poe2TreeOptions
 ) {
   return wrapHandler('optimize tree', async () => {
+    if (process.env.POE_GAME === 'poe2') {
+      const data = await planPoe2Tree(context, buildName, goalString || 'balanced', maxPoints, true, maxIterations ?? 1, constraints, options);
+      return {content:[{type:'text' as const,text:formatPoe2TreePlan(data)}],structuredContent:data};
+    }
     await context.ensureLuaClient();
     const luaClient = context.getLuaClient();
     if (!luaClient) throw new Error('Lua client not initialized');
@@ -352,7 +363,7 @@ export async function handleOptimizeTree(
     let allocatedNodes: Set<string>;
     let treeData: any;
     try {
-      const build = await context.buildService.readBuild(buildName);
+      const build = await context.buildService.readBuild(buildName ?? '');
       const allocatedNodeIds = context.buildService.parseAllocatedNodes(build);
       allocatedNodes = new Set<string>(allocatedNodeIds);
       const treeVersion = context.buildService.extractBuildVersion(build);

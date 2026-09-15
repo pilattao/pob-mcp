@@ -9,7 +9,8 @@ export interface WatchHandlerContext {
   treeService: TreeService;
 }
 
-export function handleStartWatching(context: WatchHandlerContext) {
+export async function handleStartWatching(context: WatchHandlerContext) {
+  return wrapHandler('start watching', async () => {
   if (context.watchService.isWatchEnabled()) {
     return {
       content: [
@@ -21,21 +22,23 @@ export function handleStartWatching(context: WatchHandlerContext) {
     };
   }
 
-  context.watchService.startWatching();
+  await context.watchService.startWatching();
 
   return {
     content: [
       {
         type: "text" as const,
-        text: `File watching started for: ${context.watchService.getDirectory()}\n\nYour builds will now be automatically reloaded when saved in Path of Building.`,
+        text: `File watching started for: ${context.watchService.getDirectory()}\n\nSaved XML changes invalidate the build cache; the next read loads the updated file. Live PoB sessions are not reloaded.`,
       },
     ],
   };
+  });
 }
 
 export async function handleStopWatching(context: WatchHandlerContext) {
   return wrapHandler('stop watching', async () => {
     if (!context.watchService.isWatchEnabled()) {
+      await context.watchService.stopWatching();
       return {
         content: [{ type: "text" as const, text: "File watching is not currently enabled." }],
       };
@@ -87,9 +90,11 @@ export function handleWatchStatus(context: WatchHandlerContext) {
   text += `Status: ${context.watchService.isWatchEnabled() ? "ENABLED" : "DISABLED"}\n`;
   text += `Directory: ${context.watchService.getDirectory()}\n`;
   text += `Recent changes tracked: ${changeCount}\n`;
+  const lastError = context.watchService.getLastError?.();
+  if (lastError) text += `Last watcher error: ${lastError}\n`;
 
   if (!context.watchService.isWatchEnabled()) {
-    text += `\nUse 'start_watching' to enable automatic build reloading.`;
+    text += `\nUse 'start_watching' to refresh cached file reads after saves.`;
   }
 
   return {

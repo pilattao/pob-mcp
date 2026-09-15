@@ -10,7 +10,10 @@ import type { AnyLuaClient } from '../pobLuaBridge.js';
 import { resolveLeague } from '../services/leagueResolver.js';
 import { prepareWeightedTradeQuery, validateWeightedTradeOptions } from '../services/weightedTradeQuery.js';
 
-interface TradeContext {
+import type { EvidenceContext } from '../services/poe2BuildEvidence.js';
+import { compareNativeTradeItems } from '../services/nativeTradeComparison.js';
+
+interface TradeContext extends Partial<EvidenceContext> {
   tradeClient: TradeApiClient;
   statMapper?: StatMapper;
   recommendationEngine?: ItemRecommendationEngine;
@@ -772,6 +775,9 @@ export async function handleCompareTradeItems(
   context: TradeContext,
   args: {
     item_ids: string[];
+    evaluate_native?: boolean;
+    slot?: string;
+    build_name?: string;
     query_id?: string;
     league?: string;
     build_context?: {
@@ -791,6 +797,8 @@ export async function handleCompareTradeItems(
 }> {
   return wrapHandler('compare trade items', async () => {
     const { item_ids, build_context } = args;
+    if (args.evaluate_native!==undefined && typeof args.evaluate_native!=='boolean') throw new Error('evaluate_native must be boolean');
+    if (args.evaluate_native && !args.slot?.trim()) throw new Error('Native comparison requires the exact equipment slot');
 
     if (!item_ids || item_ids.length === 0) {
       return {
@@ -819,7 +827,13 @@ export async function handleCompareTradeItems(
       const rates=await getCurrencyRatesMap(context.ninjaClient,league);
       const analyzer=new CostBenefitAnalyzer();
       const evidence=items.map(item=>analyzer.analyzeItem(item,rates));
-      return {content:[{type:'text',text:JSON.stringify({game:'poe2',league,scope:'item-evidence',
+      const unavailableListingIds=item_ids.filter(id=>!items.some(item=>item.id===id));
+      let nativeComparison;
+      if (args.evaluate_native === true) {
+        if (!context.buildService) throw new Error('Native comparison build service is unavailable');
+        nativeComparison=await compareNativeTradeItems({...context,buildService:context.buildService},items,args.slot ?? '',args.build_name);
+      }
+      return {content:[{type:'text',text:JSON.stringify({game:'poe2',league,scope:nativeComparison?'native-build-and-item-evidence':'item-evidence',nativeComparison,unavailableListingIds,
         items:evidence.map(row=>({id:row.listing.id,name:row.listing.item.name,baseType:row.listing.item.typeLine,
           price:row.priceEvidence,stats:Object.fromEntries(row.knownStats.map(key=>[key,(row.stats as any)[key]])),
           unparsedMods:row.unparsedMods,warnings:row.metrics.warnings})),

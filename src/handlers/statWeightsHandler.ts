@@ -18,6 +18,7 @@
 
 import { wrapHandler } from "../utils/errorHandling.js";
 import type { LuaHandlerContext } from "./luaHandlers.js";
+import { measurePoe2StatWeights } from '../services/poe2TreeMeasurements.js';
 
 interface Probe {
   mod: string;
@@ -75,6 +76,7 @@ export async function handleComputeStatWeights(
   customMods?: string[]
 ) {
   return wrapHandler("compute stat weights", async () => {
+    if (process.env.POE_GAME === 'poe2') return measurePoe2StatWeights(context, slot, customMods);
     await context.ensureLuaClient();
     const luaClient = context.getLuaClient();
     if (!luaClient) throw new Error("Lua client not initialized. Use lua_start first.");

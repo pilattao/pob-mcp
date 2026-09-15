@@ -2,6 +2,7 @@ import type { BuildService } from '../services/buildService.js';
 import { SkillGemService, type GemReadOptions } from '../services/skillGemService.js';
 import type { AnyLuaClient, NativeGemEvaluation, NativeGemSpec, NativeGemEvaluationRequest } from '../pobLuaBridge.js';
 import { readPoe2BuildEvidence } from '../services/poe2BuildEvidence.js';
+import { nativeBuildMatches } from '../services/nativeBuildIdentity.js';
 import { analyzeSkillSetup, formatSkillOptimization } from '../skillLinkOptimizer.js';
 import { wrapHandler } from '../utils/errorHandling.js';
 
@@ -20,8 +21,7 @@ async function evidence(context: SkillGemHandlerContext, buildName?: string) {
   if (snapshot.source === 'live' && client) {
     // The native transaction checks these exact bytes before editing its working state.
     const info = await client.getBuildInfo();
-    const identity = (s: string) => s.replace(/\\/g, '/').replace(/\.xml$/i, '').toLowerCase();
-    if (buildName && identity(info.name ?? '') !== identity(buildName)) throw new Error('Loaded build changed while collecting gem evidence; retry');
+    if (!nativeBuildMatches(buildName,info,context.buildService)) throw new Error('Loaded build changed while collecting gem evidence; retry');
     const expectedXml = await client.exportBuildXml();
     options.expectedBuildName = info.name;
     options.expectedXml = expectedXml;
@@ -39,27 +39,41 @@ export async function handleAnalyzeSkillLinks(context: SkillGemHandlerContext, a
     return response([e.note, ...a.notes, formatSkillOptimization(analyzeSkillSetup([a.group])), comparisonLimit]);
   });
 }
-function formatNative(result: NativeGemEvaluation, showAll = false): string[] {
+function formatNative(result: NativeGemEvaluation, showAll = false, resourceOnly = false): string[] {
+  const resourceField = (field: string) => field.endsWith('Cost') || field.startsWith('Ward') ||
+    ['Cooldown','Speed','CastRate','HitSpeed','Life','LifeUnreserved','Mana','ManaUnreserved','Spirit','SpiritUnreserved','EnergyShield','NetManaRegen'].includes(field);
+  const visibleOutputs = (values: Record<string, number>) => Object.fromEntries(Object.entries(values).filter(([field]) => !resourceOnly || resourceField(field)));
   const rows = showAll ? result.setups : result.ranking;
   const format = (n: number) => n.toLocaleString('en-US', {maximumFractionDigits: 4});
   const signed = (n: number) => `${n >= 0 ? '+' : ''}${format(n)}`;
-  const lines = [`Native ranking metric: ${result.metric}`, `Native baseline: ${JSON.stringify(result.baseline)}`,
+  const lines = [resourceOnly ? 'Native resource outputs for the edited skill' : `Native ranking metric: ${result.metric}`, `Native baseline: ${JSON.stringify(visibleOutputs(result.baseline))}`,
     `Applied conditions: ${JSON.stringify(result.conditions)}`,
     `Search: ${result.search.algorithm}; ${result.search.evaluations} evaluations; ${result.search.eligibleCandidates} eligible support candidates.`,
-    'Ranking covers evaluated setups under these conditions. It does not establish a global optimum or market prices.'];
+    'Ranking covers evaluated setups under these conditions. It does not establish a global optimum or market prices.',
+    'Equal modeled DPS does not establish equal infusion generation, uptime, or full combat-cycle damage. Resource rates use the native calculation assumptions.'];
   if (result.search.truncated) lines.push('Search bound reached; some candidates or combinations remain unevaluated.');
+  let rank = 0;
   for (const [index, row] of rows.entries()) {
-    lines.push('', `${index + 1}. ${row.name}${row.valid ? '' : ' [not eligible for ranking]'}`);
+    const tied = !showAll && index > 0 && row.output?.[result.metric] === rows[index - 1].output?.[result.metric];
+    if (!tied) rank = index + 1;
+    lines.push('', `${rank}. ${row.name}${tied ? ` [tied on ${result.metric}]` : ''}${row.valid ? '' : resourceOnly ? ' [resource or validity issue]' : ' [not eligible for ranking]'}`);
     if (row.error) {lines.push(`Native evaluation error: ${row.error}`);continue;}
     lines.push(`Gems: ${(row.gems ?? []).map(g => `${g.name} (${g.level}/${g.quality}, count ${g.count ?? 1})`).join(', ')}`);
-    for (const [field, value] of Object.entries(row.output ?? {})) {
+    for (const gem of row.gems ?? []) {
+      const base = gem as typeof gem & {baseCosts?: Record<string, number>; baseCooldown?: number};
+      if (base.baseCosts || base.baseCooldown !== undefined) lines.push(
+        `Base gem data before modifiers — ${gem.name}, level ${gem.level}: costs ${JSON.stringify(base.baseCosts ?? {})}${base.baseCooldown !== undefined ? `; cooldown ${base.baseCooldown} s` : ''}. Resource keys retain their native base units.`);
+    }
+    const resourceNotes = (row as typeof row & {resourceNotes?: string[]}).resourceNotes ?? [];
+    lines.push(...resourceNotes.map(note => `Resource coverage: ${note}`));
+    for (const [field, value] of Object.entries(visibleOutputs(row.output ?? {}))) {
       const delta = row.deltas?.[field];
       lines.push(`${field}: ${format(value)}${delta ? `; delta ${signed(delta.absolute)}${delta.percent !== undefined ? ` (${signed(delta.percent)}%)` : ''}` : ''}`);
     }
     for (const support of row.supports ?? []) lines.push(`Support ${support.name}: ${support.status}${support.description ? ` — ${support.description}` : ''}`);
     lines.push(...(row.warnings ?? []).map(w => `Condition: ${w}`));
   }
-  if (!result.ranking.length) lines.push('No valid complete setup qualified for ranking within this search.');
+  if (!resourceOnly && !result.ranking.length) lines.push('No valid complete setup qualified for ranking within this search.');
   if (!showAll) {
     const failed = result.setups.filter(row => !row.valid);
     if (failed.length) lines.push(`${failed.length} trials excluded because of native compatibility, requirements, or calculation errors.`,
@@ -81,14 +95,22 @@ export async function handleSuggestSupportGems(context: SkillGemHandlerContext, 
   });
 }
 export async function handleCompareGemSetups(context: SkillGemHandlerContext, args: {
-  build_name?: string; skill_index?: number; evaluation_skill_index?: number; metric?: NativeGemEvaluationRequest['metric']; setups: Array<{name: string; gems: Array<string | NativeGemSpec>}>;
+  build_name?: string; skill_index?: number; evaluation_skill_index?: number; resource_only?: boolean; metric?: NativeGemEvaluationRequest['metric']; setups: Array<{name: string; gems: Array<string | NativeGemSpec>}>;
 }) {
   return wrapHandler('compare gem setups', async () => {
     const e = await evidence(context, args.build_name);
-    const result = await context.skillGemService.compareGemSetups(e.build, args.skill_index, args.setups, {...e.options, metric: args.metric,
+    const result = await context.skillGemService.compareGemSetups(e.build, args.skill_index, args.setups, {...e.options, resourceOnly: args.resource_only, metric: args.metric,
       evaluationGroupIndex: args.evaluation_skill_index === undefined ? undefined : args.evaluation_skill_index + 1});
-    return response([e.note, '=== Native PoE2 Gem Setup Comparison ===', ...formatNative(result, true),
-      `Ranking: ${result.ranking.map(row => row.name).join(' > ') || 'no qualifying setup'}`]);
+    const ranking = result.ranking.map((row, index) => {
+      const separator = index === 0 ? '' : row.output?.[result.metric] === result.ranking[index - 1].output?.[result.metric] ? ' = ' : ' > ';
+      return separator + row.name;
+    }).join('');
+    const lines = [e.note, '=== Native PoE2 Gem Setup Comparison ===', ...formatNative(result, true, args.resource_only === true),
+      ...(args.resource_only ? [] : [`Ranking: ${ranking || 'no qualifying setup'}`])];
+    if (result.resourceComparison) lines.push('',
+      `=== Direct resource comparison for edited group ${result.resourceComparison.conditions.evaluationGroupIndex} ===`,
+      ...formatNative(result.resourceComparison, true, true));
+    return response(lines);
   });
 }
 export async function handleValidateGemQuality(context: SkillGemHandlerContext, args?: {build_name?: string; include_corrupted?: boolean}) {

@@ -4,22 +4,22 @@ import path from "path";
 import type { PoBBuild, CachedBuild, ParsedConfiguration, ConfigInput, ConfigSet, Flask, FlaskAnalysis, Jewel, JewelAnalysis } from "../types.js";
 import { resolveBuildPath } from "../utils/pathSanitizer.js";
 import { unwrapBuildXml } from "../utils/buildXml.js";
+import { protectNativeAttributeWhitespace } from "../utils/nativeAttributeWhitespace.js";
 import { parseItemRawMods } from "../utils/itemRawParser.js";
 
 const CACHE_TTL_MS = 60_000;  // 60 seconds
 const CACHE_MAX_SIZE = 20;
 
 export class BuildService {
-  private parser: XMLParser;
   private pobDirectory: string;
   private buildCache: Map<string, CachedBuild> = new Map();
 
   constructor(pobDirectory: string) {
-    this.parser = new XMLParser({
-      ignoreAttributes: false,
-      attributeNamePrefix: "",
-    });
     this.pobDirectory = pobDirectory;
+  }
+
+  getBuildFilePath(buildName: string): string {
+    return resolveBuildPath(buildName, this.pobDirectory);
   }
 
   async listBuilds(): Promise<string[]> {
@@ -80,7 +80,12 @@ export class BuildService {
   }
 
   parseBuildContent(content: string): PoBBuild {
-    return unwrapBuildXml(this.parser.parse(content), content);
+    const protectedXml = protectNativeAttributeWhitespace(content);
+    // Entities belong to this read only; neither parser state nor encoded
+    // whitespace escapes into the build DTO or the native XML serializer.
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
+    for (const [name, value] of Object.entries(protectedXml.entities)) parser.addEntity(name, value);
+    return unwrapBuildXml(parser.parse(protectedXml.xml), content);
   }
 
   generateBuildSummary(build: PoBBuild): string {

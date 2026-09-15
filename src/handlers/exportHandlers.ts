@@ -24,6 +24,7 @@ export async function handleExportBuild(
   const { exportService, buildService } = context;
 
   // Read the source build
+  buildService.invalidateBuild(args.build_name);
   const buildData = await buildService.readBuild(args.build_name);
 
   // Export the build
@@ -102,7 +103,7 @@ export async function handleSnapshotBuild(
 ) {
   return wrapHandler('snapshot build', async () => {
   const { exportService, buildService } = context;
-  const fileName = args.build_name.endsWith('.xml') ? args.build_name : `${args.build_name}.xml`;
+  const fileName = args.build_name;
 
   const result = await exportService.snapshotBuild(buildService, {
     buildName: fileName,
@@ -137,7 +138,7 @@ export async function handleListSnapshots(
 ) {
   return wrapHandler('list snapshots', async () => {
   const { exportService } = context;
-  const fileName = args.build_name.endsWith('.xml') ? args.build_name : `${args.build_name}.xml`;
+  const fileName = args.build_name;
 
   const result = await exportService.listSnapshots(fileName, {
     limit: args.limit,
@@ -163,19 +164,16 @@ export async function handleRestoreSnapshot(
     build_name: string;
     snapshot_id: string;
     backup_current?: boolean;
+    reload_live?: boolean;
   }
 ) {
   return wrapHandler('restore snapshot', async () => {
   const { exportService, buildService } = context;
+  if (args.reload_live !== undefined && typeof args.reload_live !== 'boolean') throw new Error('reload_live must be a boolean');
+  if (args.reload_live && !context.luaClient) throw new Error('Cannot reload live PoB: no active Lua client');
 
-  // Normalise exactly as snapshot_build and list_snapshots do. Snapshots live in
-  // <snapshots>/<buildName>.xml/, and those two handlers append the extension before
-  // resolving that directory — this one did not, so it looked in a directory that
-  // never exists and reported "Snapshot not found. Available snapshots:" with an
-  // EMPTY list, while list_snapshots showed the very ID being asked for.
-  // Net effect: restore could only ever work if the caller happened to pass the name
-  // WITH .xml — i.e. the rollback path for every sim was silently broken.
-  const fileName = args.build_name.endsWith('.xml') ? args.build_name : `${args.build_name}.xml`;
+  // The service resolves extensions and both relative separator styles consistently.
+  const fileName = args.build_name;
 
   const result = await exportService.restoreSnapshot({
     buildName: fileName,
@@ -191,12 +189,10 @@ export async function handleRestoreSnapshot(
   // Invalidate cache for this build
   buildService.invalidateBuild(args.build_name);
 
-  // Restoring only rewrote the file on disk. If a Lua/TCP session is live it is still
-  // holding the PRE-restore build in memory, and every subsequent stat read would be
-  // computed against state the user believes was rolled back. Push the restored XML into
-  // the session so "restored" means restored everywhere.
+  // File restoration and loading a live build are separate actions. A connected
+  // session may contain a different unsaved build; reload only when requested.
   const { luaClient } = context;
-  if (luaClient) {
+  if (luaClient && args.reload_live === true) {
     const name = args.build_name.replace(/\.xml$/i, '');
     try {
       await luaClient.loadBuildXml(result.restoredXml, name);
@@ -204,12 +200,25 @@ export async function handleRestoreSnapshot(
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       message +=
-        `\n\n⚠️ WARNING: the build FILE was restored, but pushing it into the live PoB ` +
-        `session FAILED (${detail}).\n` +
-        `PoB is still holding the pre-restore build in memory, so stats you read now will ` +
-        `NOT reflect this restore. Run lua_reload_build, or re-import the character, before ` +
-        `trusting any further numbers.`;
+        `\n\nPartial restore: the build FILE was restored, but live reload could not be verified (${detail}).\n` +
+        `Live PoB state is unknown: a queued open may already have changed it. ` +
+        `Read the live build information and stats again before using native results.`;
+      return {
+        isError: true,
+        structuredContent: {
+          fileRestored: true,
+          liveReloadVerified: false,
+          liveState: 'unknown' as const,
+          buildName: args.build_name,
+          snapshotId: args.snapshot_id,
+          ...(result.backupId ? { backupId: result.backupId } : {}),
+          error: detail,
+        },
+        content: [{ type: 'text' as const, text: message }],
+      };
     }
+  } else {
+    message += '\n\nOnly the saved build file was restored. Live PoB was not reloaded.';
   }
 
   return {
@@ -233,8 +242,9 @@ export async function handleExportBuildSummary(context: ExportContext) {
   let stats: Record<string, any> = {};
   let skills: any = null;
   let tree: any = null;
+  const unavailable: string[] = [];
 
-  try { info = await luaClient.getBuildInfo(); } catch { /* best effort */ }
+  try { info = await luaClient.getBuildInfo(); } catch { unavailable.push('build information'); }
   try {
     stats = await luaClient.getStats([
       'Life', 'EnergyShield', 'Mana', 'ManaUnreserved',
@@ -243,31 +253,41 @@ export async function handleExportBuildSummary(context: ExportContext) {
       'Armour', 'Evasion', 'PhysicalDamageReduction', 'TotalEHP',
       'LifeRegen', 'SpellSuppressionChance', 'BlockChance',
     ]) ?? {};
-  } catch { /* best effort */ }
-  try { skills = await luaClient.getSkills(); } catch { /* best effort */ }
-  try { tree = await luaClient.getTree(); } catch { /* best effort */ }
+  } catch { unavailable.push('calculated stats'); }
+  try { skills = await luaClient.getSkills(); } catch { unavailable.push('skills'); }
+  try { tree = await luaClient.getTree(); } catch { unavailable.push('tree'); }
 
   const classNames = ['Scion', 'Marauder', 'Ranger', 'Witch', 'Duelist', 'Templar', 'Shadow'];
-  const className = (tree?.classId != null ? classNames[tree.classId] : null) || info?.class || 'Unknown';
+  const poe1 = info?.game === 'poe1' || (info?.game !== 'poe2' && process.env.POE_GAME === 'poe1');
+  const className = info?.className || info?.class || tree?.className ||
+    (poe1 && tree?.classId != null ? classNames[tree.classId] : undefined) || 'Unknown';
   const buildName = info?.name || 'Unnamed Build';
   const level = info?.level || '?';
-  const ascendancy = info?.ascendancy || '';
+  const ascendancy = info?.ascendClassName || info?.ascendancy || '';
 
-  const dps = Number(stats.CombinedDPS || stats.TotalDPS || stats.MinionTotalDPS || 0);
-  const dpsLabel = (stats.MinionTotalDPS && !stats.TotalDPS) ? 'Minion DPS' : 'DPS';
+  const value = (name: string): number | undefined => {
+    const raw = stats[name];
+    if ((typeof raw !== 'number' && typeof raw !== 'string') || raw === '') return undefined;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  };
+  const display = (number: number | undefined) => number === undefined ? 'Unknown' : number.toLocaleString();
+  const dps = value('CombinedDPS') ?? value('TotalDPS') ?? value('MinionTotalDPS');
+  const dpsLabel = value('CombinedDPS') === undefined && value('TotalDPS') === undefined && value('MinionTotalDPS') !== undefined ? 'Minion DPS' : 'DPS';
 
   let output = `# ${buildName}\n\n`;
   output += `**Class:** ${className}${ascendancy ? ` (${ascendancy})` : ''}  \n`;
   output += `**Level:** ${level}\n\n`;
+  if (unavailable.length) output += `Unavailable reads: ${unavailable.join(', ')}. Missing values remain unknown.\n\n`;
 
   output += `## Key Stats\n\n`;
   output += `| Stat | Value |\n|------|-------|\n`;
-  output += `| Life | ${Number(stats.Life ?? 0).toLocaleString()} |\n`;
-  if (Number(stats.EnergyShield ?? 0) > 100) {
-    output += `| Energy Shield | ${Number(stats.EnergyShield).toLocaleString()} |\n`;
+  output += `| Life | ${display(value('Life'))} |\n`;
+  if (value('EnergyShield') !== undefined) {
+    output += `| Energy Shield | ${display(value('EnergyShield'))} |\n`;
   }
-  output += `| ${dpsLabel} | ${Math.round(dps).toLocaleString()} |\n`;
-  output += `| Total EHP | ${Number(stats.TotalEHP ?? 0).toLocaleString()} |\n`;
+  output += `| ${dpsLabel} | ${display(dps === undefined ? undefined : Math.round(dps))} |\n`;
+  output += `| Total EHP | ${display(value('TotalEHP'))} |\n`;
   output += `| Fire/Cold/Light Resist | ${stats.FireResist ?? '?'}% / ${stats.ColdResist ?? '?'}% / ${stats.LightningResist ?? '?'}% |\n`;
   output += `| Chaos Resist | ${stats.ChaosResist ?? '?'}% |\n`;
   if (Number(stats.Armour ?? 0) > 0) output += `| Armour | ${Number(stats.Armour).toLocaleString()} |\n`;
@@ -277,9 +297,9 @@ export async function handleExportBuildSummary(context: ExportContext) {
   output += '\n';
 
   // Main skill setup
-  const mainGroup = skills?.groups?.find((g: any) => g.index === skills.mainSocketGroup) || skills?.groups?.[0];
+  const mainGroup = skills?.groups?.find((g: any) => g.index === skills.mainSocketGroup && g.enabled !== false);
   if (mainGroup) {
-    const gemNames = (mainGroup.gems || []).map((g: any) => g.name || g).filter(Boolean);
+    const gemNames = (mainGroup.gems || []).filter((g: any) => g.enabled !== false).map((g: any) => g.name || g).filter(Boolean);
     output += `## Main Skill\n\n`;
     output += `**${mainGroup.label || 'Main'}:** ${gemNames.join(' + ')}\n\n`;
   }

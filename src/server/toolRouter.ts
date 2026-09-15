@@ -12,6 +12,7 @@ import type { TradeApiClient } from "../services/tradeClient.js";
 import type { StatMapper } from "../services/statMapper.js";
 import type { ItemRecommendationEngine } from "../services/itemRecommendationEngine.js";
 import type { PoeNinjaClient } from "../services/poeNinjaClient.js";
+import type { BulkExchangeQuoteSource } from "../services/poe2ExchangeQuotes.js";
 
 // Import handlers
 import { handleListBuilds, handleAnalyzeBuild, handleCompareBuilds, handleGetBuildStats, handleGetBuildNotes, handleSetBuildNotes } from "../handlers/buildHandlers.js";
@@ -38,6 +39,8 @@ import { handleGetCurrencyRates, handleFindArbitrage, handleCalculateTradingProf
 import { handleSearchClusterJewels, handleAnalyzeClusterJewels, handleAnalyzeBuildClusterJewels } from "../handlers/clusterJewelHandlers.js";
 import { handleGenerateShoppingList } from "../handlers/shoppingListHandlers.js";
 import { handlePlanLeveling } from "../handlers/levelingHandlers.js";
+import type { BossBenchmark } from '../services/poe2BossReadiness.js';
+import type { Poe2TreeOptions } from '../services/poe2TreeOptimization.js';
 import { handleCheckBossReadiness } from "../handlers/bossReadinessHandlers.js";
 import { handleSuggestWatchersEye } from "../handlers/jewelAdvisorHandlers.js";
 import { handleSuggestCrafting } from "../handlers/craftingAdvisorHandler.js";
@@ -67,6 +70,7 @@ export interface ToolRouterDependencies {
   statMapper: StatMapper | null;
   recommendationEngine: ItemRecommendationEngine | null;
   ninjaClient: PoeNinjaClient;
+  exchangeClient?: BulkExchangeQuoteSource;
   getLuaClient: () => import("../pobLuaBridge.js").AnyLuaClient | null;
   ensureLuaClient: () => Promise<void>;
 }
@@ -86,6 +90,19 @@ export type ToolResponse = Promise<{
  * them, so a human watching the GUI sees the change happen live (TCP only).
  * Cosmetic; extend freely.
  */
+function treeOptions(args: Record<string, unknown> = {}): Poe2TreeOptions {
+  return {
+    allocation_mode: args.allocation_mode as Poe2TreeOptions['allocation_mode'],
+    candidate_node_ids: args.candidate_node_ids as number[] | undefined,
+    remove_node_ids: args.remove_node_ids as number[] | undefined,
+    attribute_choices: args.attribute_choices as Poe2TreeOptions['attribute_choices'],
+    points_available: args.points_available as number | undefined,
+    max_candidates: args.max_candidates as number | undefined,
+    max_distance: args.max_distance as number | undefined,
+    preserve_keystones: args.preserve_keystones as boolean | undefined,
+  };
+}
+
 const AUTO_VIEW_BY_TOOL: Record<string, string> = {
   lua_import_character: "TREE",
   lua_set_tree: "TREE",
@@ -824,7 +841,8 @@ export async function routeToolCall(
         optimizationContext,
         args.build_name as string,
         args.goal as string,
-        (args.points_available || args.max_points) as number | undefined
+        (args.points_available ?? args.max_points) as number | undefined,
+        treeOptions(args)
       );
 
     case "optimize_tree":
@@ -835,7 +853,8 @@ export async function routeToolCall(
         args.goal as string,
         args.max_points as number | undefined,
         args.max_iterations as number | undefined,
-        args.constraints as OptimizationConstraints | undefined
+        args.constraints as OptimizationConstraints | undefined,
+        treeOptions(args)
       );
 
     case "analyze_items":
@@ -869,6 +888,9 @@ export async function routeToolCall(
           includeGems: options.include_gems as boolean | undefined, priority: options.priority as any,
           maxPricePerItem: options.max_price as number | undefined, limitPerSlot: options.limit as number | undefined,
           maxSearches: options.max_searches as number | undefined,
+          compareItems: options.compare_items as boolean | undefined,
+          maxNativeCandidates: options.max_native_candidates as number | undefined,
+          nativeMetric: options.native_metric as any,
         });
     }
 
@@ -915,13 +937,17 @@ export async function routeToolCall(
         tag_filter: args.tag_filter as string | undefined,
       });
 
-    case "restore_snapshot":
+    case "restore_snapshot": {
       if (!args) throw new Error("Missing arguments");
-      return await handleRestoreSnapshot(exportContext, {
+      if (args.reload_live === true) await deps.ensureLuaClient();
+      const restoreContext = args.reload_live === true ? deps.contextBuilder.buildExportContext() : exportContext;
+      return await handleRestoreSnapshot(restoreContext, {
         build_name: args.build_name as string,
         snapshot_id: args.snapshot_id as string,
         backup_current: args.backup_current as boolean | undefined,
+        reload_live: args.reload_live as boolean | undefined,
       });
+    }
 
     case "export_build_summary":
       return await handleExportBuildSummary(deps.contextBuilder.buildExportContext());
@@ -1080,6 +1106,9 @@ export async function routeToolCall(
       }
       if (!args) throw new Error("Missing arguments");
       const tradeContext = {
+        buildService: handlerContext.buildService,
+        getLuaClient: deps.getLuaClient,
+        ensureLuaClient: deps.ensureLuaClient,
         tradeClient: deps.tradeClient,
         statMapper: deps.statMapper || undefined,
         recommendationEngine: deps.recommendationEngine || undefined,
@@ -1141,8 +1170,10 @@ export async function routeToolCall(
     }
 
     case "find_arbitrage": {
+      if (!deps.exchangeClient) throw new Error('PoE2 bulk trade quotes require POE_GAME=poe2 and POE_TRADE_ENABLED=true');
       const ninjaContext = {
-        ninjaClient: deps.ninjaClient
+        ninjaClient: deps.ninjaClient,
+        exchangeClient: deps.exchangeClient
       };
       const merged = { ...(args ?? {}), league: resolveLeague(args?.league as string | undefined) };
       return await handleFindArbitrage(ninjaContext, merged as any);
@@ -1173,8 +1204,8 @@ export async function routeToolCall(
         ensureLuaClient: deps.ensureLuaClient,
       };
       const focus = (args?.focus as 'dps' | 'defence' | 'both') || 'both';
-      const maxResults = (args?.max_results as number) || 10;
-      return await handleGetPassiveUpgrades(upgradesContext, focus, maxResults);
+      const maxResults = (args?.max_results as number | undefined) ?? 10;
+      return await handleGetPassiveUpgrades(upgradesContext, focus, maxResults, treeOptions(args));
     }
 
     case "find_best_anointment": {
@@ -1207,8 +1238,9 @@ export async function routeToolCall(
     case "check_boss_readiness":
       if (!args?.boss) throw new Error("Missing boss name");
       return await handleCheckBossReadiness(
-        { getLuaClient: deps.getLuaClient, ensureLuaClient: deps.ensureLuaClient },
-        args.boss as string
+        { buildService: handlerContext.buildService, getLuaClient: deps.getLuaClient, ensureLuaClient: deps.ensureLuaClient },
+        args.boss as string,
+        {build_name: args.build_name as string | undefined, requirements: args.requirements as BossBenchmark[] | undefined}
       );
 
     case "plan_leveling":

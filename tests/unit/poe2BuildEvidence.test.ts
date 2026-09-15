@@ -55,4 +55,20 @@ describe('PoE2 evidence source selection',()=>{
  it('fails clearly when no file or live source exists',async()=>{
   const {service}=fixture();await expect(readPoe2BuildEvidence({buildService:service,getLuaClient:()=>null})).rejects.toThrow(/live/i);
  });
+ it('does not mix different files that have the same native build title',async()=>{
+  const {service,client}=fixture();client.getBuildInfo.mockResolvedValue({name:'Loaded',fileName:'/another/Loaded.xml',game:'poe2'});
+  const result=await readPoe2BuildEvidence({buildService:service,getLuaClient:()=>client as any},'Loaded.xml');
+  expect(result.source).toBe('file');expect(client.getStats).not.toHaveBeenCalled();
+ });
+ it('uses the matching native file path for a nested requested build',async()=>{
+  const {service,client}=fixture();client.getBuildInfo.mockResolvedValue({name:'Loaded',fileName:'/unused/nested/Loaded.xml',game:'poe2'});
+  const result=await readPoe2BuildEvidence({buildService:service,getLuaClient:()=>client as any},'nested/Loaded.xml');
+  expect(result.source).toBe('live');
+ });
+ it('recognizes the same Windows build through its WSL drive path',async()=>{
+  const {client}=fixture(),service=new BuildService('/mnt/c/PoBBuilds');
+  jest.spyOn(service,'readBuild').mockResolvedValue(service.parseBuildContent(xml));
+  client.getBuildInfo.mockResolvedValue({name:'Loaded',fileName:'C:\\PoBBuilds\\Loaded.xml',game:'poe2'});
+  const result=await readPoe2BuildEvidence({buildService:service,getLuaClient:()=>client as any},'Loaded.xml');expect(result.source).toBe('live');
+ });
 });

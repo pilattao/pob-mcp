@@ -1,476 +1,235 @@
-import { XMLBuilder } from "fast-xml-parser";
-import fs from "fs/promises";
-import path from "path";
-import type { PoBBuild, SnapshotMetadata } from "../types.js";
-import { sanitizeBuildName, resolveBuildPath } from "../utils/pathSanitizer.js";
-import { buildXmlDocument } from "../utils/buildXml.js";
+import { XMLBuilder, XMLValidator } from 'fast-xml-parser';
+import { createHash, randomUUID } from 'crypto';
+import fs from 'fs/promises';
+import path from 'path';
+import type { PoBBuild, SnapshotMetadata } from '../types.js';
+import { sanitizeBuildName, resolveBuildPath } from '../utils/pathSanitizer.js';
+import { buildXmlDocument } from '../utils/buildXml.js';
+import { BuildService } from './buildService.js';
 
-export interface ExportOptions {
-  outputName: string;
-  outputDirectory?: string;
-  overwrite?: boolean;
-  notes?: string;
-}
-
-export interface SaveTreeOptions {
-  buildName: string;
-  nodes: string[];
-  masteryEffects?: Record<string, number>;
-  backup?: boolean;
-}
-
-export interface SnapshotOptions {
-  buildName: string;
-  description?: string;
-  tag?: string;
-}
-
-export interface RestoreOptions {
-  buildName: string;
-  snapshotId: string;
-  backupCurrent?: boolean;
+export interface ExportOptions { outputName: string; outputDirectory?: string; overwrite?: boolean; notes?: string }
+export interface SaveTreeOptions { buildName: string; nodes: string[]; masteryEffects?: Record<string, number>; backup?: boolean }
+export interface SnapshotOptions { buildName: string; description?: string; tag?: string }
+export interface RestoreOptions { buildName: string; snapshotId: string; backupCurrent?: boolean }
+interface FileSnapshotMetadata extends SnapshotMetadata { game?: string; sha256?: string; statsSource?: string }
+interface SnapshotList {
+  snapshots: Array<{ id: string; metadata: FileSnapshotMetadata; filePath: string }>;
+  total: number;
+  diskSpace: number;
+  warnings?: string[];
 }
 
 export class BuildExportService {
-  private pobDirectory: string;
-  private snapshotDirectory: string;
-  private exportDirectory: string;
-  private xmlBuilder: XMLBuilder;
+  private readonly pobDirectory: string;
+  private readonly snapshotDirectory: string;
+  private readonly exportDirectory: string;
+  private readonly reader: BuildService;
+  private sequence = 0;
+  private readonly xmlBuilder = new XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: '@_',
+    format: true, indentBy: '  ', suppressEmptyNode: false, suppressBooleanAttributes: false });
 
   constructor(pobDirectory: string) {
-    this.pobDirectory = pobDirectory;
-    this.snapshotDirectory = path.join(pobDirectory, '.pob-mcp', 'snapshots');
-    this.exportDirectory = path.join(pobDirectory, '.pob-mcp', 'exports');
-
-    this.xmlBuilder = new XMLBuilder({
-      ignoreAttributes: false,
-      attributeNamePrefix: "@_",
-      format: true,
-      indentBy: "  ",
-      suppressEmptyNode: false,
-      suppressBooleanAttributes: false,
-    });
+    this.pobDirectory = path.resolve(pobDirectory);
+    this.snapshotDirectory = path.join(this.pobDirectory, '.pob-mcp', 'snapshots');
+    this.exportDirectory = path.join(this.pobDirectory, '.pob-mcp', 'exports');
+    this.reader = new BuildService(this.pobDirectory);
   }
 
-  /**
-   * Export a complete build to XML file
-   */
   async exportBuild(buildData: PoBBuild, options: ExportOptions): Promise<{ filePath: string; message: string }> {
-    // Ensure export directory exists
-    const targetDir = options.outputDirectory || this.exportDirectory;
-    await fs.mkdir(targetDir, { recursive: true });
-
-    // Append notes if provided
-    if (options.notes) {
-      const existingNotes = buildData.Notes || "";
-      const separator = existingNotes ? "\n\n---\n\n" : "";
-      buildData.Notes = existingNotes + separator + options.notes;
+    const build = structuredClone(buildData);
+    if (options.notes !== undefined) {
+      if (typeof options.notes !== 'string') throw new Error('Export notes must be a string');
+      if (options.notes) build.Notes = (build.Notes ?? '') + (build.Notes ? '\n\n---\n\n' : '') + options.notes;
     }
-
-    // Validate build data before export
-    await this.validateBuildData(buildData);
-
-    // Generate XML
-    const xmlContent = this.buildToXML(buildData);
-
-    // Determine output path
-    const fileName = options.outputName.endsWith('.xml')
-      ? options.outputName
-      : `${options.outputName}.xml`;
-    const filePath = sanitizeBuildName(fileName, targetDir);
-
-    // Check if file exists and handle overwrite
-    await this.safeWrite(filePath, xmlContent, options.overwrite || false);
-
-    return {
-      filePath,
-      message: `Build exported successfully to: ${filePath}`,
-    };
+    if (!build.Build || !build.Tree) throw new Error('Invalid build: Missing Build or Tree section');
+    const xml = this.buildToXML(build);
+    const target = options.outputDirectory || this.exportDirectory;
+    const filePath = resolveBuildPath(options.outputName, target);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await this.safeWrite(filePath, xml, options.overwrite === true);
+    return { filePath, message: `Build exported successfully to: ${filePath}` };
   }
 
-  /**
-   * Update only the passive tree in an existing build file
-   */
-  async saveTree(buildService: any, options: SaveTreeOptions): Promise<{ message: string; backupPath?: string }> {
-    const buildPath = resolveBuildPath(options.buildName, this.pobDirectory);
-
-    // Create backup if requested
-    let backupPath: string | undefined;
-    if (options.backup !== false) {
-      backupPath = await this.createBackup(options.buildName);
+  async saveTree(buildService: BuildService, options: SaveTreeOptions): Promise<{ message: string; backupPath?: string }> {
+    if (!Array.isArray(options.nodes) || options.nodes.some(node => typeof node !== 'string' || !/^\d+$/.test(node) || !Number.isSafeInteger(Number(node)))) {
+      throw new Error('Tree nodes must be an array of numeric node IDs');
     }
-
-    // Read existing build
-    const build = await buildService.readBuild(options.buildName);
-
-    // Update tree nodes
+    const buildPath = resolveBuildPath(options.buildName, this.pobDirectory);
+    const content = await fs.readFile(buildPath, 'utf8');
+    const build = this.parseDocument(content);
     const spec = buildService.getActiveSpec(build);
-    if (!spec) {
-      throw new Error("No active spec found in build");
+    if (!spec) throw new Error('No active spec found in build');
+    if (options.masteryEffects && Object.keys(options.masteryEffects).length && build.__xmlRoot === 'PathOfBuilding2') {
+      throw new Error('PoE1 mastery effects cannot be written into a PoE2 tree');
     }
-
-    // Update nodes
-    const oldNodes = spec.nodes ? spec.nodes.split(',').map((n: string) => n.trim()).filter((n: string) => n.length > 0) : [];
-    spec.nodes = options.nodes.join(',');
-
-    // Update mastery effects if provided
-    if (options.masteryEffects) {
-      // Remove existing mastery effects
-      if (spec.MasteryEffect) {
-        delete spec.MasteryEffect;
-      }
-
-      // Add new mastery effects
-      const masteryEffects = Object.entries(options.masteryEffects).map(([nodeId, effectId]) => ({
-        node: nodeId,
-        effect: effectId.toString(),
-      }));
-
-      if (masteryEffects.length > 0) {
-        spec.MasteryEffect = masteryEffects;
-      }
+    const oldNodes: string[] = spec.nodes?.split(',').filter(Boolean) ?? [];
+    const nodes = [...new Set(options.nodes)];
+    spec.nodes = nodes.join(',');
+    if (options.masteryEffects && build.__xmlRoot !== 'PathOfBuilding2') {
+      const effects = Object.entries(options.masteryEffects);
+      if (effects.some(([node, effect]) => !/^\d+$/.test(node) || !Number.isSafeInteger(effect) || effect < 0)) throw new Error('Invalid mastery effect');
+      delete spec.MasteryEffect;
+      if (effects.length) spec.MasteryEffect = effects.map(([node, effect]) => ({ node, effect: String(effect) }));
     }
-
-    // Generate updated XML
-    const xmlContent = this.buildToXML(build);
-
-    // Write to file
-    await fs.writeFile(buildPath, xmlContent, 'utf-8');
-
-    const nodesAdded = options.nodes.filter((n: string) => !oldNodes.includes(n)).length;
-    const nodesRemoved = oldNodes.filter((n: string) => !options.nodes.includes(n)).length;
-
-    return {
-      message: `Tree updated successfully. Nodes added: ${nodesAdded}, removed: ${nodesRemoved}`,
-      backupPath,
-    };
+    const xml = this.buildToXML(build);
+    const backup = options.backup !== false ? await this.writeSnapshot(content, { buildName: options.buildName, tag: 'backup', description: 'Before save_tree' }) : undefined;
+    await this.safeWrite(buildPath, xml, true);
+    buildService.invalidateBuild(options.buildName);
+    return { message: `Tree updated successfully. Nodes added: ${nodes.filter(node => !oldNodes.includes(node)).length}, removed: ${oldNodes.filter(node => !nodes.includes(node)).length}`,
+      backupPath: backup?.snapshotPath };
   }
 
-  /**
-   * Create a versioned snapshot of a build
-   */
-  async snapshotBuild(
-    buildService: any,
-    options: SnapshotOptions
-  ): Promise<{ snapshotId: string; snapshotPath: string }> {
-    // Create snapshot directory for this build
-    const buildSnapshotDir = resolveBuildPath(options.buildName, this.snapshotDirectory);
-    await fs.mkdir(buildSnapshotDir, { recursive: true });
+  async snapshotBuild(_buildService: BuildService, options: SnapshotOptions): Promise<{ snapshotId: string; snapshotPath: string }> {
+    const content = await fs.readFile(resolveBuildPath(options.buildName, this.pobDirectory), 'utf8');
+    return this.writeSnapshot(content, options);
+  }
 
-    // Generate snapshot ID (timestamp-based)
-    const timestamp = new Date();
-    const snapshotId = timestamp.toISOString().replace(/[:.]/g, '-').split('.')[0];
-
-    // Create tag-based filename
+  private async writeSnapshot(content: string, options: SnapshotOptions, allowUnparsed = false): Promise<{ snapshotId: string; snapshotPath: string }> {
+    let build: PoBBuild | undefined;
+    let parseWarning = '';
+    try { build = this.parseDocument(content); }
+    catch (error) {
+      if (!allowUnparsed) throw error;
+      parseWarning = ' (Unparsed current file retained byte-for-byte)';
+    }
+    const directory = resolveBuildPath(options.buildName, this.snapshotDirectory);
+    const timestamp = new Date().toISOString();
+    // UUID protects simultaneous service instances; the sequence orders same-ms snapshots in this instance.
+    const snapshotId = `${timestamp.replace(/[:.]/g, '-')}-${String(++this.sequence).padStart(6, '0')}-${randomUUID()}`;
     const tag = options.tag || 'snapshot';
-    const snapshotFileName = `${snapshotId}_${this.sanitizeFileName(tag)}.xml`;
-    const snapshotPath = path.join(buildSnapshotDir, snapshotFileName);
-
-    // Read and copy build
-    const buildPath = resolveBuildPath(options.buildName, this.pobDirectory);
-    const buildContent = await fs.readFile(buildPath, 'utf-8');
-    await fs.writeFile(snapshotPath, buildContent, 'utf-8');
-
-    // Create metadata
-    const build = await buildService.readBuild(options.buildName);
-    const nodes = buildService.parseAllocatedNodes(build);
-
-    const metadata: SnapshotMetadata = {
-      timestamp: timestamp.toISOString(),
-      originalBuild: options.buildName,
-      description: options.description || '',
-      tag,
-      statsSnapshot: {
-        life: this.extractStat(build, 'Life'),
-        dps: this.extractStat(build, 'TotalDPS'),
-        allocatedNodes: nodes.length,
-      },
+    if (typeof tag !== 'string' || (options.description !== undefined && typeof options.description !== 'string')) throw new Error('Snapshot tag and description must be strings');
+    const snapshotPath = sanitizeBuildName(`${snapshotId}_${this.sanitizeFileName(tag)}.xml`, directory);
+    const metadata: FileSnapshotMetadata = {
+      timestamp, originalBuild: options.buildName, description: (options.description ?? '') + parseWarning, tag,
+      game: build ? build.__xmlRoot === 'PathOfBuilding2' ? 'poe2' : 'poe1' : undefined,
+      sha256: this.hash(content), statsSource: build ? 'saved-xml' : 'unparsed-saved-xml',
+      statsSnapshot: build ? { life: this.extractStat(build, 'Life'), dps: this.extractStat(build, 'TotalDPS'),
+        allocatedNodes: this.reader.parseAllocatedNodes(build).length } : {},
     };
-
-    // Write metadata
-    const metadataPath = path.join(buildSnapshotDir, `${snapshotId}_metadata.json`);
-    await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2), 'utf-8');
-
-    return {
-      snapshotId,
-      snapshotPath,
-    };
+    await fs.mkdir(directory, { recursive: true });
+    await this.safeWrite(snapshotPath, content, false);
+    try { await this.safeWrite(path.join(directory, `${snapshotId}_metadata.json`), JSON.stringify(metadata, null, 2), false); }
+    catch (error) { await fs.unlink(snapshotPath).catch(() => {}); throw error; }
+    return { snapshotId, snapshotPath };
   }
 
-  /**
-   * List all snapshots for a build
-   */
-  async listSnapshots(
-    buildName: string,
-    options: { limit?: number; tagFilter?: string } = {}
-  ): Promise<{
-    snapshots: Array<{ id: string; metadata: SnapshotMetadata; filePath: string }>;
-    total: number;
-    diskSpace: number;
-  }> {
-    const buildSnapshotDir = resolveBuildPath(buildName, this.snapshotDirectory);
-
-    // Check if snapshot directory exists
-    try {
-      await fs.access(buildSnapshotDir);
-    } catch {
-      return { snapshots: [], total: 0, diskSpace: 0 };
-    }
-
-    // Read all metadata files
-    const entries = await fs.readdir(buildSnapshotDir, { withFileTypes: true });
-    const metadataFiles = entries.filter(e => e.isFile() && e.name.endsWith('_metadata.json'));
-
-    let snapshots: Array<{ id: string; metadata: SnapshotMetadata; filePath: string }> = [];
-    let totalSize = 0;
-
-    for (const file of metadataFiles) {
-      const metadataPath = path.join(buildSnapshotDir, file.name);
-      const metadataContent = await fs.readFile(metadataPath, 'utf-8');
-      const metadata: SnapshotMetadata = JSON.parse(metadataContent);
-
-      // Apply tag filter if provided
-      if (options.tagFilter && metadata.tag !== options.tagFilter) {
-        continue;
-      }
-
-      // Extract snapshot ID from filename
-      const snapshotId = file.name.replace('_metadata.json', '');
-      const xmlFileName = `${snapshotId}_${this.sanitizeFileName(metadata.tag)}.xml`;
-      const xmlFilePath = path.join(buildSnapshotDir, xmlFileName);
-
-      // Get file size
+  async listSnapshots(buildName: string, options: { limit?: number; tagFilter?: string } = {}): Promise<SnapshotList> {
+    if (options.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit < 0)) throw new Error('Snapshot limit must be a nonnegative integer');
+    const directory = resolveBuildPath(buildName, this.snapshotDirectory);
+    let entries;
+    try { entries = await fs.readdir(directory, { withFileTypes: true }); }
+    catch (error: any) { if (error.code === 'ENOENT') return { snapshots: [], total: 0, diskSpace: 0 }; throw error; }
+    const snapshots: SnapshotList['snapshots'] = [], warnings: string[] = [];
+    let diskSpace = 0;
+    for (const entry of entries.filter(entry => entry.isFile() && entry.name.endsWith('_metadata.json'))) {
       try {
-        const stats = await fs.stat(xmlFilePath);
-        totalSize += stats.size;
-      } catch {
-        // File may not exist, skip
-        continue;
-      }
-
-      snapshots.push({
-        id: snapshotId,
-        metadata,
-        filePath: xmlFilePath,
-      });
+        const metadata: FileSnapshotMetadata = JSON.parse(await fs.readFile(path.join(directory, entry.name), 'utf8'));
+        if (typeof metadata.tag !== 'string' || !Number.isFinite(Date.parse(metadata.timestamp))) throw new Error('Invalid metadata');
+        if (options.tagFilter !== undefined && metadata.tag !== options.tagFilter) continue;
+        const id = entry.name.replace(/_metadata\.json$/, '');
+        const filePath = sanitizeBuildName(`${id}_${this.sanitizeFileName(metadata.tag)}.xml`, directory);
+        const stat = await fs.stat(filePath);
+        if (!stat.isFile()) throw new Error('Snapshot is not a file');
+        diskSpace += stat.size;
+        snapshots.push({ id, metadata, filePath });
+      } catch (error) { warnings.push(`Skipped ${entry.name}: ${error instanceof Error ? error.message : String(error)}`); }
     }
-
-    // Sort by timestamp (newest first)
-    snapshots.sort((a, b) =>
-      new Date(b.metadata.timestamp).getTime() - new Date(a.metadata.timestamp).getTime()
-    );
-
-    // Apply limit
-    const total = snapshots.length;
-    if (options.limit && options.limit > 0) {
-      snapshots = snapshots.slice(0, options.limit);
+    // Older save_tree/restore wrote these files without metadata. Keep their IDs
+    // usable; disclose that their timestamps come from the filesystem.
+    const metadataIds = new Set(entries.filter(e => e.name.endsWith('_metadata.json')).map(e => e.name.replace(/_metadata\.json$/, '')));
+    for (const entry of entries.filter(entry => entry.isFile())) {
+      const match = entry.name.match(/^(.+)_(backup|before-restore)\.xml$/i);
+      if (!match || metadataIds.has(match[1]) || (options.tagFilter !== undefined && options.tagFilter !== match[2])) continue;
+      const filePath = sanitizeBuildName(entry.name, directory);
+      const stat = await fs.stat(filePath);
+      diskSpace += stat.size;
+      snapshots.push({ id: match[1], filePath, metadata: {
+        timestamp: stat.mtime.toISOString(), originalBuild: buildName, tag: match[2], statsSnapshot: {},
+        description: 'Legacy XML-only backup; timestamp is file modification time, saved stats unavailable.',
+      } });
     }
-
-    return {
-      snapshots,
-      total,
-      diskSpace: totalSize,
-    };
+    snapshots.sort((a, b) => Date.parse(b.metadata.timestamp) - Date.parse(a.metadata.timestamp) || b.id.localeCompare(a.id));
+    return { snapshots: options.limit === undefined ? snapshots : snapshots.slice(0, options.limit), total: snapshots.length, diskSpace, warnings };
   }
 
-  /**
-   * Restore a build from a snapshot
-   */
-  async restoreSnapshot(options: RestoreOptions): Promise<{
-    message: string;
-    backupId?: string;
-    /** XML written to the build file — callers push this into a live PoB session. */
-    restoredXml: string;
-  }> {
-    // Find snapshot by ID or tag
-    const buildSnapshotDir = resolveBuildPath(options.buildName, this.snapshotDirectory);
-
-    // List snapshots and find matching one
+  async restoreSnapshot(options: RestoreOptions): Promise<{ message: string; backupId?: string; restoredXml: string }> {
+    if (typeof options.snapshotId !== 'string' || !options.snapshotId.trim()) throw new Error('Snapshot ID or tag is required');
     const { snapshots } = await this.listSnapshots(options.buildName);
-
-    const snapshot = snapshots.find(s =>
-      s.id === options.snapshotId ||
-      s.metadata.tag === options.snapshotId
-    );
-
-    if (!snapshot) {
-      throw new Error(
-        `Snapshot not found: ${options.snapshotId}. ` +
-        `Available snapshots: ${snapshots.map(s => `${s.id} [${s.metadata.tag}]`).join(', ')}`
-      );
-    }
-
-    // Create backup of current build if requested
-    let backupId: string | undefined;
-    if (options.backupCurrent !== false) {
-      const timestamp = new Date();
-      backupId = timestamp.toISOString().replace(/[:.]/g, '-').split('.')[0];
-
-      const backupPath = path.join(buildSnapshotDir, `${backupId}_before-restore.xml`);
-      const buildPath = resolveBuildPath(options.buildName, this.pobDirectory);
-      const currentContent = await fs.readFile(buildPath, 'utf-8');
-      await fs.writeFile(backupPath, currentContent, 'utf-8');
-    }
-
-    // Restore from snapshot
+    const snapshot = snapshots.find(snapshot => snapshot.id === options.snapshotId) ?? snapshots.find(snapshot => snapshot.metadata.tag === options.snapshotId);
+    if (!snapshot) throw new Error(`Snapshot not found: ${options.snapshotId}. Available snapshots: ${snapshots.map(s => `${s.id} [${s.metadata.tag}]`).join(', ')}`);
+    const content = await fs.readFile(snapshot.filePath, 'utf8');
+    this.parseDocument(content);
+    if (snapshot.metadata.sha256 && snapshot.metadata.sha256 !== this.hash(content)) throw new Error('Snapshot content does not match its recorded checksum');
     const buildPath = resolveBuildPath(options.buildName, this.pobDirectory);
-    const snapshotContent = await fs.readFile(snapshot.filePath, 'utf-8');
-    await fs.writeFile(buildPath, snapshotContent, 'utf-8');
-
-    return {
-      message: `Build restored from snapshot: ${snapshot.metadata.tag} (${snapshot.id})`,
-      backupId,
-      restoredXml: snapshotContent,
-    };
+    let backup: { snapshotId: string; snapshotPath: string } | undefined;
+    let currentMissing = false;
+    if (options.backupCurrent !== false) {
+      let current: string | undefined;
+      try { current = await fs.readFile(buildPath, 'utf8'); }
+      catch (error: any) { if (error.code !== 'ENOENT') throw error; currentMissing = true; }
+      if (current !== undefined) backup = await this.writeSnapshot(current, {
+        buildName: options.buildName, tag: 'before-restore', description: `Before restoring ${snapshot.id}`,
+      }, true);
+    }
+    await fs.mkdir(path.dirname(buildPath), { recursive: true });
+    await this.safeWrite(buildPath, content, true);
+    return { message: `Build file restored from snapshot: ${snapshot.metadata.tag} (${snapshot.id})` +
+      (currentMissing ? '\nNo current file existed to back up.' : ''), backupId: backup?.snapshotId, restoredXml: content };
   }
 
-  /**
-   * Convert build data to XML string
-   */
+  private parseDocument(content: string): PoBBuild {
+    if (XMLValidator.validate(content) !== true) throw new Error('Invalid build XML');
+    const build = this.reader.parseBuildContent(content);
+    if (!build.Build) throw new Error('Invalid build: Missing Build section');
+    return build;
+  }
   private buildToXML(build: PoBBuild): string {
-    const xmlObj = buildXmlDocument(build);
-    let xmlContent = this.xmlBuilder.build(xmlObj);
-
-    // Add XML declaration if not present
-    if (!xmlContent.startsWith('<?xml')) {
-      xmlContent = '<?xml version="1.0" encoding="UTF-8"?>\n' + xmlContent;
-    }
-
-    return xmlContent;
+    const xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + this.xmlBuilder.build(buildXmlDocument(build));
+    this.parseDocument(xml);
+    return xml;
+  }
+  private hash(content: string): string { return createHash('sha256').update(content).digest('hex'); }
+  private sanitizeFileName(name: string): string { return name.replace(/[^a-zA-Z0-9-_]/g, '-').replace(/-+/g, '-').toLowerCase(); }
+  private extractStat(build: PoBBuild, name: string): number | undefined {
+    const stats = build.Build?.PlayerStat;
+    const value = (Array.isArray(stats) ? stats : stats ? [stats] : []).find(stat => stat.stat === name)?.value;
+    if (value === undefined || value === '') return undefined;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
   }
 
-  /**
-   * Validate build data before export
-   */
-  private async validateBuildData(build: PoBBuild): Promise<void> {
-    if (!build.Build) {
-      throw new Error("Invalid build: Missing Build section");
-    }
-
-    if (!build.Tree) {
-      throw new Error("Invalid build: Missing Tree section");
-    }
-
-    // Validate that we can generate XML
-    try {
-      const xml = this.buildToXML(build);
-      if (!xml || xml.length === 0) {
-        throw new Error("Failed to generate XML");
-      }
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      throw new Error(`XML generation failed: ${errorMsg}`);
-    }
-  }
-
-  /**
-   * Safely write file with overwrite protection
-   */
+  /** Exclusive creation prevents overwrite races; replacement uses a complete sibling file. */
   private async safeWrite(filePath: string, content: string, overwrite: boolean): Promise<void> {
-    if (!overwrite) {
-      try {
-        await fs.access(filePath);
-        throw new Error(
-          `File already exists: ${filePath}\n` +
-          `Set overwrite=true to replace the existing file.`
-        );
-      } catch (error: any) {
-        // File doesn't exist, safe to write
-        if (error.code !== 'ENOENT') {
-          throw error;
-        }
-      }
+    const target = overwrite ? path.join(path.dirname(filePath), `.${path.basename(filePath)}.${randomUUID()}.tmp`) : filePath;
+    let handle;
+    try { handle = await fs.open(target, 'wx'); }
+    catch (error: any) {
+      if (error.code === 'EEXIST') throw new Error(`File already exists: ${filePath}. Set overwrite=true to replace the existing file.`);
+      throw error;
     }
-
-    await fs.writeFile(filePath, content, 'utf-8');
+    try {
+      await handle.writeFile(content, 'utf8');
+      await handle.sync();
+      await handle.close();
+      if (overwrite) await fs.rename(target, filePath);
+    } catch (error) {
+      await handle.close().catch(() => {});
+      await fs.unlink(target).catch(() => {});
+      throw error;
+    }
   }
 
-  /**
-   * Create a timestamped backup of a build
-   */
-  private async createBackup(buildName: string): Promise<string> {
-    const buildPath = resolveBuildPath(buildName, this.pobDirectory);
-    const buildSnapshotDir = resolveBuildPath(buildName, this.snapshotDirectory);
-    await fs.mkdir(buildSnapshotDir, { recursive: true });
-
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').split('.')[0];
-    const backupFileName = `${timestamp}_backup.xml`;
-    const backupPath = path.join(buildSnapshotDir, backupFileName);
-
-    const content = await fs.readFile(buildPath, 'utf-8');
-    await fs.writeFile(backupPath, content, 'utf-8');
-
-    return backupPath;
-  }
-
-  /**
-   * Sanitize filename by removing invalid characters
-   */
-  private sanitizeFileName(name: string): string {
-    return name
-      .replace(/[^a-zA-Z0-9-_]/g, '-')
-      .replace(/-+/g, '-')
-      .toLowerCase();
-  }
-
-  /**
-   * Extract a stat value from build data
-   */
-  private extractStat(build: PoBBuild, statName: string): number {
-    if (!build.Build?.PlayerStat) {
-      return 0;
+  formatSnapshotList(result: SnapshotList): string {
+    const lines = result.snapshots.length ? [`=== Snapshots (Showing ${result.snapshots.length} of ${result.total}) ===`, ''] : ['No matching snapshots to display.'];
+    for (const [index, snapshot] of result.snapshots.entries()) {
+      const { metadata, id } = snapshot;
+      lines.push(`${index + 1}. ${new Date(metadata.timestamp).toLocaleString()} [${metadata.tag}]`);
+      if (metadata.description) lines.push(`   Description: ${metadata.description}`);
+      const stats = metadata.statsSnapshot;
+      if (stats) lines.push(`   Saved XML stats: Life: ${stats.life?.toLocaleString() ?? 'N/A'} | DPS: ${stats.dps?.toLocaleString() ?? 'N/A'} | Nodes: ${stats.allocatedNodes ?? 'N/A'}`);
+      lines.push(`   ID: ${id}`, '');
     }
-
-    const stats = Array.isArray(build.Build.PlayerStat)
-      ? build.Build.PlayerStat
-      : [build.Build.PlayerStat];
-
-    const stat = stats.find(s => s.stat === statName);
-    return stat ? parseFloat(stat.value) : 0;
-  }
-
-  /**
-   * Format snapshot list for display
-   */
-  formatSnapshotList(result: {
-    snapshots: Array<{ id: string; metadata: SnapshotMetadata; filePath: string }>;
-    total: number;
-    diskSpace: number;
-  }): string {
-    if (result.snapshots.length === 0) {
-      return "No snapshots found for this build.";
-    }
-
-    let output = `=== Snapshots (Showing ${result.snapshots.length} of ${result.total}) ===\n\n`;
-
-    for (let i = 0; i < result.snapshots.length; i++) {
-      const { id, metadata } = result.snapshots[i];
-      const date = new Date(metadata.timestamp);
-      const formattedDate = date.toLocaleString();
-
-      output += `${i + 1}. ${formattedDate}`;
-      if (metadata.tag) {
-        output += ` [${metadata.tag}]`;
-      }
-      output += '\n';
-
-      if (metadata.description) {
-        output += `   Description: ${metadata.description}\n`;
-      }
-
-      if (metadata.statsSnapshot) {
-        const stats = metadata.statsSnapshot;
-        output += `   Stats: Life: ${stats.life?.toLocaleString() || 'N/A'} | `;
-        output += `DPS: ${stats.dps?.toLocaleString() || 'N/A'} | `;
-        output += `Nodes: ${stats.allocatedNodes || 'N/A'}\n`;
-      }
-
-      output += `   ID: ${id}\n\n`;
-    }
-
-    const sizeInMB = (result.diskSpace / (1024 * 1024)).toFixed(2);
-    output += `Total: ${result.total} snapshots | Disk space: ${sizeInMB} MB\n`;
-
-    return output;
+    lines.push(`Total: ${result.total} snapshots | Disk space: ${(result.diskSpace / (1024 * 1024)).toFixed(2)} MB`, ...(result.warnings ?? []));
+    return lines.join('\n');
   }
 }

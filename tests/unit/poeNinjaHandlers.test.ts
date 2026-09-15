@@ -21,10 +21,9 @@ it('labels game, league, units and unknown source age without presentation instr
   expect(text).not.toMatch(/verbatim|show.*ALL|Last Updated|real.time/i);
 });
 
-it('explains missing quote evidence instead of inferring an efficient market', async () => {
-  const text = (await handleFindArbitrage(context, { league, min_profit_percent: 0 })).content[0].text;
-  expect(text).toMatch(/missing.*directional.*quotes/i);
-  expect(text).not.toMatch(/market is efficient|lowering|act quickly|verbatim/i);
+it('requires bulk quotes instead of deriving arbitrage from aggregate valuations', async () => {
+  await expect(handleFindArbitrage(context, { league, min_profit_percent: 0 })).rejects.toThrow(/bulk exchange.*not configured/i);
+  expect(globalThis.fetch).not.toHaveBeenCalled();
 });
 
 it('labels a reference round trip as a valuation calculation, not executable profit', async () => {

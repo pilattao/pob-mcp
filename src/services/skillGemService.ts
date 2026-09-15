@@ -45,6 +45,7 @@ export interface GemReadOptions {
   source?: 'live' | 'file';
   expectedBuildName?: string;
   expectedXml?: string;
+  resourceOnly?: boolean;
   evaluationGroupIndex?: number;
   metric?: NativeGemEvaluationRequest['metric'];
   liveSkills?: any;
@@ -60,6 +61,9 @@ export interface GemSuggestion {
   compatibility: SupportCompatibility;
   /** Candidates are unranked; no DPS or price is inferred from a description. */
   requires: string[];
+}
+export interface GemComparison extends NativeGemEvaluation {
+  resourceComparison?: NativeGemEvaluation;
 }
 export interface GemUpgrade {
   gem: string;
@@ -164,7 +168,12 @@ class InstalledPoe2GemData implements GemDataProvider {
     if (!gemTable) throw new Error('Installed PoB2 Gems.lua contains no gem table');
     const effects: Record<string, any> = {};
     for (const file of files) {
-      for (const node of ast(file).body) {
+      const body = ast(file).body;
+      // Releases populate the supplied table directly; newer source data returns
+      // a factory. Read literal assignments from either form without executing it.
+      const factory = body.find((node: any) => node.type === 'ReturnStatement')?.arguments?.[0];
+      const statements = factory?.type === 'FunctionDeclaration' ? factory.body : body;
+      for (const node of statements) {
         if (node.type !== 'AssignmentStatement') continue;
         node.variables.forEach((variable: any, i: number) => {
           if (variable.type === 'IndexExpression' && variable.base?.name === 'skills') {
@@ -367,7 +376,7 @@ export class SkillGemService {
     return {client: options.client, expectedBuildName: options.expectedBuildName, expectedXml: options.expectedXml};
   }
   private async evaluateNative(model: Awaited<ReturnType<SkillGemService['prepareBuild']>>, index: number | undefined,
-    options: GemReadOptions, request: Pick<NativeGemEvaluationRequest, 'setups' | 'search' | 'metric'>): Promise<NativeGemEvaluation> {
+    options: GemReadOptions, request: Pick<NativeGemEvaluationRequest, 'setups' | 'search' | 'metric'> & {resourceOnly?: boolean}): Promise<NativeGemEvaluation> {
     const native = this.nativeContext(options);
     const group = this.at(model.groups, index);
     if (options.evaluationGroupIndex !== undefined && (!Number.isInteger(options.evaluationGroupIndex) || options.evaluationGroupIndex < 1)) throw new Error('Invalid evaluation skill index');
@@ -376,7 +385,8 @@ export class SkillGemService {
     if (!result?.rollback || !['xmlUnchanged', 'statsUnchanged', 'selectionsUnchanged', 'undoUnchanged'].every(k => (result.rollback as any)[k] === true)) {
       throw new Error('Native gem evaluation did not verify complete rollback; numerical results rejected');
     }
-    if (!Array.isArray(result.ranking) || !Array.isArray(result.setups) || !Number.isFinite(result.baseline?.[result.metric])) {
+    if (request.resourceOnly && result.metric !== 'resource-only') throw new Error('Native evaluator does not support resource-only comparisons; deploy the API 1.4 gem evaluator');
+    if (!Array.isArray(result.ranking) || !Array.isArray(result.setups) || (!request.resourceOnly && !Number.isFinite(result.baseline?.[result.metric]))) {
       throw new Error('Native gem evaluation returned an invalid baseline or ranking');
     }
     for (const row of result.ranking) {
@@ -385,7 +395,7 @@ export class SkillGemService {
     return result;
   }
   async compareGemSetups(build: PoBBuild, skillIndex: number | undefined,
-    setups: Array<{name: string; gems: Array<string | NativeGemSpec>}>, options: GemReadOptions = {}) {
+    setups: Array<{name: string; gems: Array<string | NativeGemSpec>}>, options: GemReadOptions = {}): Promise<GemComparison> {
     this.nativeContext(options);
     if (!Array.isArray(setups) || setups.length < 2 || setups.length > 10) throw new Error('Provide 2 to 10 setups for bounded comparison');
     const model = await this.prepareBuild(build, options);
@@ -416,28 +426,37 @@ export class SkillGemService {
       }
       normalized.push({name: setup.name, gems});
     }
-    let combined: NativeGemEvaluation | undefined;
-    const stable = (value: any): any => Array.isArray(value) ? value.map(stable) : value && typeof value === 'object'
-      ? Object.fromEntries(Object.keys(value).sort().map(key => [key, stable(value[key])])) : value;
-    for (let offset = 0; offset < normalized.length;) {
-      const requested = normalized.slice(offset);
-      const batch = await this.evaluateNative(model, skillIndex, options, {setups: requested});
-      if (!batch.setups.length || batch.setups.length > requested.length ||
-        batch.setups.some((row, index) => row.name !== requested[index].name)) throw new Error('Native gem comparison returned incomplete or mismatched setup identities');
-      if (combined) {
-        if (batch.metric !== combined.metric || JSON.stringify(stable(batch.baseline)) !== JSON.stringify(stable(combined.baseline)) ||
-          JSON.stringify(stable(batch.conditions)) !== JSON.stringify(stable(combined.conditions))) throw new Error('Native baseline or conditions changed between comparison batches');
-        combined.setups.push(...batch.setups);
-        combined.search.evaluations += batch.search.evaluations;
-      } else combined = {...batch, setups: [...batch.setups], search: {...batch.search}};
-      offset += batch.setups.length;
-      if (offset < normalized.length && !batch.search.truncated) throw new Error('Native gem comparison omitted requested setups');
+    const evaluateAll = async (evaluationOptions: GemReadOptions, resourceOnly = false): Promise<NativeGemEvaluation> => {
+      let combined: NativeGemEvaluation | undefined;
+      const stable = (value: any): any => Array.isArray(value) ? value.map(stable) : value && typeof value === 'object'
+        ? Object.fromEntries(Object.keys(value).sort().map(key => [key, stable(value[key])])) : value;
+      for (let offset = 0; offset < normalized.length;) {
+        const requested = normalized.slice(offset);
+        const batch = await this.evaluateNative(model, skillIndex, evaluationOptions, {setups: requested, ...(resourceOnly ? {resourceOnly: true} : {})});
+        if (!batch.setups.length || batch.setups.length > requested.length ||
+          batch.setups.some((row, index) => row.name !== requested[index].name)) throw new Error('Native gem comparison returned incomplete or mismatched setup identities');
+        if (combined) {
+          if (batch.metric !== combined.metric || JSON.stringify(stable(batch.baseline)) !== JSON.stringify(stable(combined.baseline)) ||
+            JSON.stringify(stable(batch.conditions)) !== JSON.stringify(stable(combined.conditions))) throw new Error('Native baseline or conditions changed between comparison batches');
+          combined.setups.push(...batch.setups);
+          combined.search.evaluations += batch.search.evaluations;
+        } else combined = {...batch, setups: [...batch.setups], search: {...batch.search}};
+        offset += batch.setups.length;
+        if (offset < normalized.length && !batch.search.truncated) throw new Error('Native gem comparison omitted requested setups');
+      }
+      combined!.ranking = resourceOnly ? [] : combined!.setups.filter(row => row.valid && Number.isFinite(row.output?.[combined!.metric]))
+        .sort((a,b) => b.output![combined!.metric] - a.output![combined!.metric]);
+      combined!.search.truncated = false;
+      return combined!;
+    };
+    const result: GemComparison = await evaluateAll(options, options.resourceOnly === true);
+    if (options.evaluationGroupIndex !== undefined && options.evaluationGroupIndex !== current.index &&
+      current.gems.some(g => g.enabled !== false && g.isSupport === false)) {
+      result.resourceComparison = await evaluateAll({...options, evaluationGroupIndex: current.index, metric: undefined}, true);
     }
-    combined!.ranking = combined!.setups.filter(row => row.valid && Number.isFinite(row.output?.[combined!.metric]))
-      .sort((a,b) => b.output![combined!.metric] - a.output![combined!.metric]);
-    combined!.search.truncated = false;
-    return combined!;
+    return result;
   }
+
   async rankSupportGems(build: PoBBuild, skillIndex: number | undefined, options: GemReadOptions & {count?: number} = {}) {
     this.nativeContext(options);
     const limit = options.count ?? 5;

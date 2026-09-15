@@ -5,6 +5,19 @@
  * These schemas describe the available tools, their parameters, and documentation.
  */
 
+function treePlanningFields() {
+  return {
+    allocation_mode: {type: 'string', enum: ['shared', 'weapon1', 'weapon2'], description: 'Where newly allocated passives belong; native results are measured in both weapon sets.'},
+    candidate_node_ids: {type: 'array', items: {type: 'integer', minimum: 1}},
+    remove_node_ids: {type: 'array', items: {type: 'integer', minimum: 1}},
+    attribute_choices: {type: 'object', additionalProperties: {type: 'string', enum: ['str', 'dex', 'int']}},
+    points_available: {type: 'integer', minimum: 0, maximum: 30, description: 'Explicit spending limit, including zero. Otherwise use known native/quest budget evidence.'},
+    max_candidates: {type: 'integer', minimum: 1, maximum: 40},
+    max_distance: {type: 'integer', minimum: 1, maximum: 10},
+    preserve_keystones: {type: 'boolean'},
+  };
+}
+
 function shoppingFields() {
   const minimum = {type: 'number', minimum: 0};
   const requirements = {type: 'object', additionalProperties: false, properties: {
@@ -33,6 +46,10 @@ export interface JsonSchemaProp {
   type: string;
   description?: string;
   enum?: string[];
+  minimum?: number;
+  maximum?: number;
+  minItems?: number;
+  maxItems?: number;
   items?: JsonSchemaProp;
   properties?: Record<string, JsonSchemaProp>;
   required?: string[];
@@ -130,7 +147,7 @@ export function getToolSchemas(): ToolSchema[] {
     },
     {
       name: "start_watching",
-      description: "Start monitoring the builds directory for changes. Builds will be auto-reloaded when saved in PoB.",
+      description: "Watch build-file changes, record events and invalidate the file-reading cache. Does not reload or replace the live PoB session.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -151,7 +168,7 @@ export function getToolSchemas(): ToolSchema[] {
         type: "object",
         properties: {
           limit: {
-            type: "number",
+            type: "integer", minimum: 0, maximum: 50,
             description: "Maximum number of recent changes to return (default: 10)",
           },
         },
@@ -555,7 +572,7 @@ export function getToolSchemas(): ToolSchema[] {
     },
     {
       name: "get_node_power",
-      description: "Return passive nodes ranked by PoB's built-in node power score (the same heat-map data shown by 'Show Node Power' on the tree). Each node gets an offence score (DPS contribution) and a defence score (life/armour/ES/evasion contribution). Requires the power to have been calculated — either enable 'Show Node Power' in PoB first, or pass recalculate=true (starts PoB's PowerBuilder; the API drives it in the background and partial data is available immediately). ⚠ Cost scales with the build's calc weight: on a build using the spectre MODELING GROUP (multiple Raise Spectre instances), a full recalculation is ~1300 nodes × several minion environments and can take MINUTES, degrading PoB's responsiveness meanwhile — consider temporarily disabling the modeling group (toggle_socket_group enabled=false) before tree-power work, then re-enabling. The API no longer pre-warms this on connect and never auto-restarts it on build changes (that starved the TCP bridge).",
+      description: "Read the native node-power heat-map cache, or request its recalculation. Scores are an opaque native heuristic with unverified cache freshness; they are not legal allocation plans or measured DPS/EHP deltas. Modeling groups and the build remain unchanged.",
       inputSchema: {
         type: "object",
         properties: {
@@ -570,11 +587,11 @@ export function getToolSchemas(): ToolSchema[] {
             description: "Which nodes to include. Default: unallocated (most useful for 'what to take next').",
           },
           max_depth: {
-            type: "number",
+            type: "integer", minimum: 0, maximum: 100,
             description: "Only return nodes within this many hops from the current allocated tree. Omit for no limit.",
           },
           limit: {
-            type: "number",
+            type: "integer", minimum: 0, maximum: 100,
             description: "Maximum number of results to return. Default: 20.",
           },
           recalculate: {
@@ -917,14 +934,13 @@ export function getLuaToolSchemas(): any[] {
     },
     {
       name: "compute_stat_weights",
-      description:
-        "Measure the loaded build's empirical DPS/EHP sensitivity to individual stat mods (life, attributes, attack/cast speed, crit, flat damage, resists) via non-mutating PoB sims — the user's build is never modified. Returns per-unit weights that replace hand-curated intuition: feed them to find_weighted_trade_items and record them in build-profile.md Sections 3-4. Run at gear/crafting pre-flight and after respecs. Requires the probe_stat_weights PoB API action (reinstall TCP API if missing).",
+      description: "Measure finite differences in native PoB2 output for explicit probe modifiers. Results depend on the selected skill, weapon set, carrier item and probe magnitude; they are not universal weights or a proof of actual upgrade gains.",
       inputSchema: {
         type: "object",
         properties: {
           slot: {
             type: "string",
-            description: "Carrier slot whose equipped item hosts the probe mods (default: first equipped of Ring 1/Ring 2/Amulet/Belt/Helmet/Boots/Gloves). Results are slot-independent for global mods.",
+            description: "Carrier slot whose equipped item hosts the probe mods (default: first equipped of Ring 1/Ring 2/Amulet/Belt/Helmet/Boots/Gloves). Carrier effects and local modifiers can change the measurement.",
           },
           mods: {
             type: "array",
@@ -1541,10 +1557,11 @@ export function getOptimizationToolSchemas(): any[] {
     },
     {
       name: "suggest_optimal_nodes",
-      description: "AI-powered suggestion of optimal passive nodes based on build goals",
+      description: "Propose connected PoE2 passive paths using actual native output in both weapon sets, point budgets and attribute choices. Bounded proposals remain unapplied.",
       inputSchema: {
         type: "object",
         properties: {
+          ...treePlanningFields(),
           build_name: {
             type: "string",
             description: "Build to optimize",
@@ -1554,19 +1571,20 @@ export function getOptimizationToolSchemas(): any[] {
             description: "Optimization goal: 'damage', 'defense', 'life', 'es', or stat name",
           },
           points_available: {
-            type: "number",
-            description: "Number of passive points to spend (default: 10)",
+            type: "integer", minimum: 0, maximum: 30,
+            description: "Explicit point-spending ceiling; zero is preserved and no unknown quest points are invented.",
           },
         },
-        required: ["build_name", "goal"],
+        required: process.env.POE_GAME === "poe1" ? ["build_name", "goal"] : ["goal"],
       },
     },
     {
       name: "optimize_tree",
-      description: "Full passive tree optimization - removes inefficient nodes and reallocates to better options",
+      description: "Calculate cumulative PoE2 passive reallocations under explicit constraints and per-weapon budgets. Reports the bounded search and actual native measurements; does not apply the proposal.",
       inputSchema: {
         type: "object",
         properties: {
+          ...treePlanningFields(),
           build_name: {
             type: "string",
             description: "Build to optimize",
@@ -1575,6 +1593,8 @@ export function getOptimizationToolSchemas(): any[] {
             type: "string",
             description: "Primary optimization goal: 'damage', 'defense', 'balanced'",
           },
+          max_points: {type: 'integer', minimum: 0, maximum: 30},
+          max_iterations: {type: 'integer', minimum: 1, maximum: 5},
           constraints: {
             type: "object",
             description: "Constraints like minimum life, required keystones, etc.",
@@ -1584,7 +1604,7 @@ export function getOptimizationToolSchemas(): any[] {
             description: "Whether to preserve allocated keystones (default: true)",
           },
         },
-        required: ["build_name", "goal"],
+        required: process.env.POE_GAME === "poe1" ? ["build_name", "goal"] : ["goal"],
       },
     },
     {
@@ -1620,6 +1640,9 @@ export function getOptimizationToolSchemas(): any[] {
       description: "Plan a PoE2 build adaptation using selected equipment/gems and an explicit budget for additional purchases. Allocates distinct quoted candidates within the total; current possessions are retained, not assigned invented prices. Does not save a build or infer combined DPS from individual item modifiers.",
       inputSchema: {type: 'object', properties: {
         ...shoppingFields(),
+        compare_items: {type: 'boolean', description: 'Compare complete equipment candidates with the live native build; default true when available.'},
+        max_native_candidates: {type: 'integer', minimum: 1, maximum: 12},
+        native_metric: {type: 'string', enum: ['CombinedDPS', 'TotalDPS', 'FullDPS', 'TotalEHP', 'Life', 'EnergyShield'], description: 'Order verified positive native gains per budget currency; selected items are also evaluated together.'},
         budget_tier: {type: 'string', enum: ['league-start', 'low', 'budget', 'medium', 'endgame', 'high']},
       }},
     },
@@ -1894,7 +1917,7 @@ export function getExportToolSchemas(): any[] {
             description: "Build to list snapshots for",
           },
           limit: {
-            type: "number",
+            type: "integer", minimum: 0,
             description: "Maximum number of snapshots to return (optional)",
           },
           tag_filter: {
@@ -1907,7 +1930,7 @@ export function getExportToolSchemas(): any[] {
     },
     {
       name: "restore_snapshot",
-      description: "Restore a build from a snapshot. Optionally creates a backup of current state before restoring.",
+      description: "Restore a saved build file from a validated snapshot or backup. Creates a current-file backup by default. Live PoB reload is separate and requires reload_live=true.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1917,8 +1940,9 @@ export function getExportToolSchemas(): any[] {
           },
           snapshot_id: {
             type: "string",
-            description: "Snapshot ID (timestamp) or tag to restore from",
+            description: "Exact snapshot/backup ID or tag. A tag selects its newest snapshot; prefer an ID for an exact revision.",
           },
+          reload_live: {type: 'boolean', description: 'Also load the restored file into live PoB. Default false; this replaces the currently loaded native build.'},
           backup_current: {
             type: "boolean",
             description: "Create snapshot of current state before restore (default: true)",
@@ -2119,11 +2143,14 @@ export function getTradeToolSchemas(): any[] {
     },
     {
       name: "compare_trade_items",
-      description: "Compare returned listing IDs from a known search. PoE2 requires query_id, preserves quoted currencies and uses supplied-source reference conversions. Item properties/modifiers are not whole-build DPS/EHP gains.",
+      description: "Compare returned listings with exact prices and currencies. Set evaluate_native and a slot for independent native PoB2 replacement calculations bound to the current build. Incomplete item conversion remains explicit; numerical outputs require verified state preservation.",
       inputSchema:{type:"object",properties:{
         item_ids:{type:"array",minItems:1,maxItems:5,items:{type:"string"}},
         query_id:{type:"string",description:"Search ID that produced these listings."},
         league:{type:"string",description:"Expected PoE2 league; fetched mismatches are rejected."},
+        evaluate_native:{type:"boolean",description:"Calculate each item as a replacement in the loaded PoB2 build; default false."},
+        slot:{type:"string",description:"Exact slot, required when evaluate_native is true."},
+        build_name:{type:"string",description:"Optional name of the matching loaded build for native comparison."},
         build_context:{type:"object",description:"Optional item-contribution goals; not inferred build gains."},
       },required:poe2?["item_ids","query_id","league"]:["item_ids"]},
     },
@@ -2186,17 +2213,18 @@ export function getBuildGoalsToolSchemas(): any[] {
     },
     {
       name: "get_passive_upgrades",
-      description: "Find the best unallocated notable passives to pick up next, ranked by their actual stat impact. Uses calcWith to simulate each candidate and scores by relative DPS/EHP gain.",
+      description: "Compare connected PoE2 passive upgrade proposals in both weapon sets with native measurements. Preserves zero result/point limits; proposals are not applied.",
       inputSchema: {
         type: "object",
         properties: {
+          ...treePlanningFields(),
           focus: {
             type: "string",
             description: "What to optimize for (default: 'both')",
             enum: ["dps", "defence", "both"],
           },
           max_results: {
-            type: "number",
+            type: "integer", minimum: 0, maximum: 100,
             description: "Maximum number of upgrade suggestions to return (default: 10)",
           },
         },
@@ -2204,21 +2232,21 @@ export function getBuildGoalsToolSchemas(): any[] {
     },
     {
       name: "find_best_anointment",
-      description: "Rank the best anointable notables for the loaded build by simulating the impact of each anoint via PoB's MiscCalculator (non-destructive, same engine the GUI uses to sort anoints in the item picker). Iterates ALL anointable notables across the tree (~400) — not a keyword-filtered subset. Requires an anointable item equipped in the target slot: any Amulet, or a Cord Belt for the Belt slot.",
+      description: "Compare native PoE2 instilling candidates using actual item eligibility and native recipes. Reports deltas against both the current and uninstilled item; multiple objectives remain separate, with no fixed combined score.",
       inputSchema: {
         type: "object",
         properties: {
           slot: {
             type: "string",
-            description: "Slot of the anointable item: 'Amulet' or 'Belt' (Belt only works if a Cord Belt is equipped).",
+            description: "Exact equipped slot. Native item data determines whether it can be instilled.",
           },
           focus: {
             type: "string",
-            description: "What to optimize for (default: 'both'). 'dps' = pure DPS impact, 'defence' = pure EHP impact, 'both' = combined (DPS weight 1.0, EHP weight 0.5 — matches PoB's TradeQueryGenerator defaults).",
+            description: "Objective: dps, defence, or both. Both returns alternatives without combining the objectives into a fixed score.",
             enum: ["dps", "defence", "both"],
           },
           max_results: {
-            type: "number",
+            type: "integer", minimum: 0, maximum: 50,
             description: "Maximum number of anoint candidates to return (default: 10).",
           },
         },
@@ -2243,14 +2271,18 @@ export function getBuildGoalsToolSchemas(): any[] {
     },
     {
       name: "check_boss_readiness",
-      description: "Check if the loaded build meets the recommended thresholds for a specific endgame boss (Shaper, Elder, Sirus, Maven, Uber Elder, Eater of Worlds, Searing Exarch)",
+      description: "Inspect current PoE2 defenses and selected-skill outputs for a native boss identity. Optionally compare explicit caller-defined stat benchmarks. Does not substitute PoE1 boss presets or infer encounter completion from arbitrary Life/DPS thresholds.",
       inputSchema: {
         type: "object",
         properties: {
           boss: {
             type: "string",
-            description: "Boss name: 'shaper', 'elder', 'sirus', 'maven', 'uber_elder', 'eater', 'exarch', or 'pinnacle' for generic endgame",
+            description: "Exact PoE2 boss name from native world-area data, or an alias such as arbiter, olroth, zarokh, xesht or trialmaster.",
           },
+          build_name: {type: 'string', description: 'Optional saved build name; omission uses current unsaved native state.'},
+          requirements: {type: 'array', maxItems: 50, description: 'Caller-defined benchmarks, not official boss requirements.', items: {
+            type: 'object', properties: {stat: {type: 'string'}, min: {type: 'number'}, max: {type: 'number'}}, required: ['stat'],
+          }},
         },
         required: ["boss"],
       },
@@ -2319,17 +2351,23 @@ export function getPoeNinjaToolSchemas(): any[] {
     },
     {
       name: "find_arbitrage",
-      description: "Inspect whether directional buy/sell quotes, quantities and costs are available to establish arbitrage. The current poe.ninja reference feed cannot prove executable opportunities; missing evidence is reported explicitly. Use the exact league.",
+      description: "Find bounded 2–3-leg PoE2 currency cycles from actual directional bulk-trade quotations and advertised stock. Whole-unit sizing and leftovers are explicit. The percentage threshold is gross before unknown fees; overlapping candidates are alternatives and fills/net profit remain unverified. Requires trade access enabled.",
       inputSchema: {
         type: "object",
         properties: {
+          reference_diagnostic: {type: 'boolean', description: 'Show quote/reference-rate deviations and shared listing dependencies without changing the quoted cycle calculation; default true.'},
+          currencies: {type: 'array', minItems: 2, maxItems: 3, items: {type: 'string'}, description: 'Distinct native IDs; default divine, exalted, chaos.'},
+          start_currency: {type: 'string', description: 'One of currencies; default first entry.'},
+          start_amount: {type: 'integer', minimum: 1, description: 'Available whole units of the starting currency; default 1.'},
+          max_steps: {type: 'integer', enum: [2, 3]},
+          max_quotes_per_pair: {type: 'integer', minimum: 1, maximum: 20},
           league: {
             type: "string",
             description: "Exact league as specified, e.g. Forbidden Rites or HC Forbidden Rites. Concurrent leagues remain separate.",
           },
           min_profit_percent: {
             type: "number",
-            description: "Minimum profit percentage to show (default: 1.0). Lower values find more opportunities but with smaller profits.",
+            description: "Minimum gross percentage on the deployed starting currency, before unknown costs; default 1.0.",
           },
         },
         required: ["league"],

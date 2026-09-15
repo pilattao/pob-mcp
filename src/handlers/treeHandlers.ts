@@ -3,11 +3,14 @@ import type { TreeService } from "../services/treeService.js";
 import type { TreeAnalysisResult, TreeComparison, PassiveTreeNode, AllocationChange, PassiveTreeData } from "../types.js";
 import type { AnyLuaClient } from "../pobLuaBridge.js";
 import { handleGetBuildIssues } from "./buildGoalsHandlers.js";
+import { planPoe2Tree, formatPoe2TreePlan, type Poe2TreeOptions } from '../services/poe2TreeOptimization.js';
+import { readPoe2NodePower } from '../services/poe2TreeMeasurements.js';
 
 export interface TreeHandlerContext {
   buildService: BuildService;
   treeService: TreeService;
   getLuaClient?: () => AnyLuaClient | null;
+  ensureLuaClient?: () => Promise<void>;
 }
 
 export interface PassiveUpgradesContext {
@@ -541,8 +544,14 @@ export async function handlePlanTreePaths(
 export async function handleGetPassiveUpgrades(
   context: PassiveUpgradesContext,
   focus: 'dps' | 'defence' | 'both' = 'both',
-  maxResults: number = 10
+  maxResults: number = 10,
+  options?: Poe2TreeOptions
 ) {
+  if (process.env.POE_GAME === 'poe2') {
+    if (!Number.isInteger(maxResults) || maxResults < 0 || maxResults > 100) throw new Error('max_results must be an integer from 0 to 100');
+    const data = await planPoe2Tree(context, undefined, focus, maxResults === 0 ? 0 : options?.points_available, maxResults !== 0, 1, {}, options);
+    return {content:[{type:'text' as const,text:formatPoe2TreePlan(data,maxResults)}],structuredContent:data};
+  }
   await context.ensureLuaClient();
   const luaClient = context.getLuaClient();
   if (!luaClient) throw new Error('Lua bridge not active. Use lua_start and lua_load_build first.');
@@ -848,6 +857,7 @@ export async function handleGetNodePower(
   limit?: number,
   recalculate?: boolean,
 ) {
+  if (process.env.POE_GAME === 'poe2') return readPoe2NodePower(context, mode, filter, maxDepth, limit, recalculate);
   const luaClient = context.getLuaClient?.();
   if (!luaClient) {
     return {
