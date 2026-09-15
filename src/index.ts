@@ -108,14 +108,14 @@ class PoBMCPServer {
     // Initialize Trade API client (if enabled)
     const tradeEnabled = process.env.POE_TRADE_ENABLED === 'true';
     if (tradeEnabled) {
-      const requestsPerSecond = parseInt(process.env.POE_RATE_LIMIT_PER_SECOND || '4', 10);
+      const requestsPerSecond = parseInt(process.env.POE_RATE_LIMIT_PER_SECOND || (process.env.POE_GAME === 'poe1' ? '4' : '1'), 10);
       const cacheTTL = parseInt(process.env.POE_CACHE_TTL || '300', 10);
       this.tradeClient = new TradeApiClient({
         requestsPerSecond,
         cacheTTL,
       });
       this.statMapper = new StatMapper();
-      this.recommendationEngine = new ItemRecommendationEngine(this.tradeClient, this.statMapper);
+      this.recommendationEngine = new ItemRecommendationEngine(this.tradeClient, this.statMapper, this.ninjaClient);
       console.error('[Trade API] Enabled with rate limit:', requestsPerSecond, 'req/s');
     } else {
       console.error('[Trade API] Disabled (set POE_TRADE_ENABLED=true to enable)');
@@ -290,10 +290,8 @@ class PoBMCPServer {
       // Add skill gem analysis tools
       tools.push(...getSkillGemToolSchemas());
 
-      // Add Trade API tools if enabled
-      if (this.tradeClient) {
-        tools.push(...getTradeToolSchemas());
-      }
+      // Shopping also works as an unpriced plan without market access.
+      tools.push(...getTradeToolSchemas().filter(tool => this.tradeClient || tool.name === 'generate_shopping_list'));
 
       // Add poe.ninja API tools (always available)
       tools.push(...getPoeNinjaToolSchemas());
@@ -369,7 +367,7 @@ class PoBMCPServer {
         await this.statMapper.loadFromTradeAPI(statData);
         console.error('[StatMapper] Successfully loaded official stat data');
       } catch (error) {
-        console.error('[StatMapper] Failed to load official stats, using static fallback:', error);
+        console.error('[StatMapper] Official metadata unavailable; unverified PoE2 aliases remain disabled:', error);
         // Static mappings already loaded in constructor as fallback
       }
     }
@@ -384,6 +382,9 @@ class PoBMCPServer {
     console.error("Path of Building MCP Server running on stdio");
   }
 }
+
+// This branch targets PoE2. An explicit poe1 setting remains supported.
+process.env.POE_GAME ??= 'poe2';
 
 // Start the server
 const server = new PoBMCPServer();

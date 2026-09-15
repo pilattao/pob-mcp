@@ -3,7 +3,8 @@ import type { BuildService } from "../services/buildService.js";
 import type { TreeService } from "../services/treeService.js";
 import type { OptimizationConstraints } from "../types/optimization.js";
 import fs from "fs/promises";
-import { analyzeDefenses, formatDefensiveAnalysis } from "../defensiveAnalyzer.js";
+import { analyzeDefenses, formatDefensiveAnalysis, analyzePoe2Defenses, formatPoe2DefensiveAnalysis, POE2_DEFENSE_FIELDS } from "../defensiveAnalyzer.js";
+import { readPoe2BuildEvidence } from "../services/poe2BuildEvidence.js";
 import { wrapHandler } from "../utils/errorHandling.js";
 import { sanitizeBuildName } from "../utils/pathSanitizer.js";
 
@@ -15,11 +16,61 @@ export interface OptimizationHandlerContext {
   ensureLuaClient: () => Promise<void>;
 }
 
+function defenseEvidenceContext(context: OptimizationHandlerContext, requiredLiveName?: string): OptimizationHandlerContext {
+  const identity = (name: string) => name.replace(/\\/g, '/').replace(/\.xml$/i, '').toLowerCase();
+  return {
+    ...context,
+    getLuaClient: () => {
+      const client = context.getLuaClient();
+      if (!client) return null;
+      return new Proxy(client, {
+        get(target, property) {
+          if (property === 'getStats') {
+            return (fields?: string[]) => target.getStats(fields ?? [...POE2_DEFENSE_FIELDS]);
+          }
+          if (property === 'getBuildInfo' && requiredLiveName) {
+            return async () => {
+              const info = await target.getBuildInfo();
+              if (typeof info?.name !== 'string' || identity(info.name) !== identity(requiredLiveName)) {
+                throw new Error(`Requested unsaved build "${requiredLiveName}" is not the current native build`);
+              }
+              return info;
+            };
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+    },
+  };
+}
+
 export async function handleAnalyzeDefenses(
   context: OptimizationHandlerContext,
   buildName?: string
 ) {
   return wrapHandler('analyze defenses', async () => {
+    if (process.env.POE_GAME === 'poe2') {
+      // Request the full defense outputs within the service's existing identity
+      // guard, so neither extra stats nor header selections can come from a
+      // different build. Bind other methods to the original native client.
+      let evidence;
+      try {
+        evidence = await readPoe2BuildEvidence(defenseEvidenceContext(context), buildName);
+      } catch (error) {
+        if (!buildName || (error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
+        // A named native build can be unsaved and have no XML on disk. Retry
+        // only missing files, with the exact requested identity checked by both
+        // getBuildInfo calls inside the evidence service's read transaction.
+        evidence = await readPoe2BuildEvidence(defenseEvidenceContext(context, buildName));
+      }
+      const analysis = analyzePoe2Defenses(evidence.stats, evidence.build);
+      const sourceNote = evidence.source === 'file' && !evidence.note.includes('saved stats can be stale')
+        ? evidence.note + ' Saved outputs are not recalculated; saved stats can be stale.' : evidence.note;
+      const header = `Analyzing: ${buildName ?? 'current live PoB2 build'}\n${sourceNote}`;
+      return { content: [{ type: 'text' as const, text: header + '\n\n' + formatPoe2DefensiveAnalysis(analysis) }] };
+    }
+
     if (!buildName) {
       throw new Error('build_name is required. Please specify which build to analyze.');
     }

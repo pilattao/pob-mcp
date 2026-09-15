@@ -45,6 +45,7 @@ export async function handleSearchClusterJewels(
   }>;
 }> {
   return wrapHandler('search cluster jewels', async () => {
+    if ((process.env.POE_GAME ?? 'poe2') === 'poe2') throw new Error('PoE2 cluster-jewel generation/notable filters have no verified counterpart in the installed PoB2 catalog. Use PoE2 jewel searches and native radius tools; PoE1 filters are not sent.');
     const {
       league,
       size: sizeRaw,

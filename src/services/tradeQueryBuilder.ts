@@ -1,3 +1,4 @@
+import { tradeGame } from './tradeClient.js';
 import {
   TradeQuery,
   StatFilterGroup,
@@ -18,6 +19,39 @@ import {
  * - Online-only filtering
  */
 export class TradeQueryBuilder {
+  private readonly game = tradeGame();
+  private equipment(field: string, value: {min?:number;max?:number}): this {
+    this.query.query.filters ??= {};
+    this.query.query.filters.equipment_filters ??= {filters:{}};
+    this.query.query.filters.equipment_filters.filters![field] = value;
+    return this;
+  }
+  withRuneSockets(min?:number,max?:number):this {return this.equipment('rune_sockets',{min,max});}
+  withSpirit(min?:number,max?:number):this {return this.equipment('spirit',{min,max});}
+  withWard(min?:number,max?:number):this {return this.equipment('ward',{min,max});}
+  /** Gem acquisition level, distinct from item level and character requirements. */
+  withGemLevel(min?: number, max?: number): this {
+    const filters = this.query.query.filters ??= {};
+    const misc = (filters as typeof filters & {
+      misc_filters?: { filters?: Record<string, { min?: number; max?: number }> };
+    }).misc_filters ??= {};
+    (misc.filters ??= {}).gem_level = { min, max };
+    return this;
+  }
+  /** Quality uses the native trade type filter for both equipment and gems. */
+  withQuality(min?: number, max?: number): this {
+    const filters = this.query.query.filters ??= {};
+    const type = filters.type_filters ??= {};
+    (type.filters ??= {}).quality = { min, max };
+    return this;
+  }
+  withItemState(field:'corrupted'|'identified',value:boolean):this {
+    if(typeof value!=='boolean')throw new Error(`${field} must be a boolean`);
+    const filters=this.query.query.filters??={};
+    const misc=(filters as any).misc_filters??={filters:{}};
+    misc.filters[field]={option:String(value)};
+    return this;
+  }
   private query: TradeQuery = {
     query: {
       status: { option: 'available' },
@@ -66,7 +100,13 @@ export class TradeQueryBuilder {
       'warstaff': 'weapon.warstaff',
     };
 
-    const typeLower = type.toLowerCase();
+    if (this.game === 'poe2') Object.assign(categoryMap, {
+      crossbow:'weapon.crossbow', spear:'weapon.spear', flail:'weapon.flail',
+      quarterstaff:'weapon.warstaff', talisman:'weapon.talisman', focus:'armour.focus',
+      buckler:'armour.buckler', charm:'flask.charm', rune:'currency.rune',
+      tablet:'map.tablet', waystone:'map.waystone',
+    });
+    const typeLower = type.trim().toLowerCase();
     const category = categoryMap[typeLower];
 
     if (category) {
@@ -135,7 +175,12 @@ export class TradeQueryBuilder {
       this.query.query.filters.trade_filters.filters = {};
     }
 
-    // Only set sale_type if not 'any' - omitting it allows all types
+    // PoE2's omitted default is Buyout or Fixed Price. Explicit any includes other sale types.
+    if (this.game === 'poe2') {
+      if (saleType === 'priced') delete this.query.query.filters.trade_filters.filters.sale_type;
+      else this.query.query.filters.trade_filters.filters.sale_type = {option:saleType};
+      return this;
+    }
     if (saleType !== 'any') {
       this.query.query.filters.trade_filters.filters.sale_type = {
         option: saleType,
@@ -148,7 +193,7 @@ export class TradeQueryBuilder {
   /**
    * Set price range filter
    */
-  withPriceRange(min?: number, max?: number, currency: string = 'chaos'): this {
+  withPriceRange(min?: number, max?: number, currency: string | null = 'chaos'): this {
     if (!this.query.query.filters) {
       this.query.query.filters = {};
     }
@@ -160,8 +205,7 @@ export class TradeQueryBuilder {
     }
 
     this.query.query.filters.trade_filters.filters.price = {
-      min,
-      max,
+      min, max, ...(currency === null ? {} : {option:currency}),
     };
 
     return this;
@@ -214,6 +258,7 @@ export class TradeQueryBuilder {
    * Set link requirement
    */
   withLinks(min?: number, max?: number): this {
+    if (this.game === 'poe2') throw new Error('PoE2 equipment has rune sockets, not linked gem sockets; use rune socket constraints');
     if (!this.query.query.filters) {
       this.query.query.filters = {};
     }
@@ -236,6 +281,7 @@ export class TradeQueryBuilder {
    * Set socket color requirements
    */
   withSockets(r?: number, g?: number, b?: number, w?: number): this {
+    if (this.game === 'poe2') throw new Error('PoE2 equipment socket colors cannot constrain skill support groups');
     if (!this.query.query.filters) {
       this.query.query.filters = {};
     }
@@ -260,6 +306,7 @@ export class TradeQueryBuilder {
    * Set weapon DPS requirement
    */
   withDPS(min?: number, max?: number): this {
+    if (this.game === 'poe2') return this.equipment('dps',{min,max});
     if (!this.query.query.filters) {
       this.query.query.filters = {};
     }
@@ -282,6 +329,7 @@ export class TradeQueryBuilder {
    * Set physical DPS requirement
    */
   withPDPS(min?: number, max?: number): this {
+    if (this.game === 'poe2') return this.equipment('pdps',{min,max});
     if (!this.query.query.filters) {
       this.query.query.filters = {};
     }
@@ -304,6 +352,7 @@ export class TradeQueryBuilder {
    * Set elemental DPS requirement
    */
   withEDPS(min?: number, max?: number): this {
+    if (this.game === 'poe2') return this.equipment('edps',{min,max});
     if (!this.query.query.filters) {
       this.query.query.filters = {};
     }
@@ -326,6 +375,12 @@ export class TradeQueryBuilder {
    * Add armour/evasion/ES requirements
    */
   withDefenses(armour?: { min?: number; max?: number }, evasion?: { min?: number; max?: number }, es?: { min?: number; max?: number }): this {
+    if (this.game === 'poe2') {
+      if (armour) this.equipment('ar',armour);
+      if (evasion) this.equipment('ev',evasion);
+      if (es) this.equipment('es',es);
+      return this;
+    }
     if (!this.query.query.filters) {
       this.query.query.filters = {};
     }
@@ -438,8 +493,12 @@ export class TradeQueryBuilder {
         'Ring 2': 'accessory.ring',
         'Belt': 'accessory.belt',
       };
-      // Note: Type filtering needs category option in type_filters
-      // This is simplified - actual implementation would need category support
+      Object.assign(slotToType, { 'Weapon 1 Swap':'weapon', 'Ring 3':'accessory.ring', 'Charm 1':'flask.charm', 'Charm 2':'flask.charm', 'Charm 3':'flask.charm', 'Flask 1':'flask.life', 'Flask 2':'flask.mana' });
+      if (requirements.itemCategory) builder.withCategory(requirements.itemCategory);
+      else if (builder.game === 'poe2' && /Weapon 2(?: Swap)?/.test(requirements.slot)) {
+        throw new Error('Specify itemCategory for a PoE2 offhand: weapon, shield, focus, quiver or buckler have different compatibility');
+      } else if (slotToType[requirements.slot]) builder.withCategory(slotToType[requirements.slot]);
+      else throw new Error(`Unknown equipment slot: ${requirements.slot}`);
     }
 
     // Links
@@ -469,6 +528,9 @@ export class TradeQueryBuilder {
     }
 
     // Defenses
+    if (requirements.minWard !== undefined) builder.withWard(requirements.minWard);
+    if (requirements.minSpirit !== undefined) builder.withSpirit(requirements.minSpirit);
+    if (requirements.minRuneSockets !== undefined) builder.withRuneSockets(requirements.minRuneSockets);
     if (requirements.minArmour || requirements.minEvasion || requirements.minES) {
       builder.withDefenses(
         requirements.minArmour ? { min: requirements.minArmour } : undefined,
@@ -478,7 +540,7 @@ export class TradeQueryBuilder {
     }
 
     // Resistances
-    if (requirements.fireResist || requirements.coldResist || requirements.lightningResist) {
+    if (requirements.fireResist || requirements.coldResist || requirements.lightningResist || requirements.chaosResist) {
       builder.withResistances({
         fire: requirements.fireResist || 0,
         cold: requirements.coldResist || 0,
@@ -495,7 +557,7 @@ export class TradeQueryBuilder {
         min: requirements.minLife,
       });
     }
-    if (requirements.minES) {
+    if (requirements.minES && builder.game !== 'poe2') {
       lifeESStats.push({
         id: 'pseudo.pseudo_total_energy_shield',
         min: requirements.minES,
@@ -517,7 +579,8 @@ export class TradeQueryBuilder {
    * Apply common search options
    */
   applyOptions(options: SearchOptions): this {
-    if (options.onlineOnly !== false) {
+    if (options.onlineOnly === false && !options.onlineStatus) this.withOnlineStatus('any');
+    if (options.onlineOnly !== false || options.onlineStatus) {
       // Default to 'available' (both instant-buyout and in-person trade items).
       // Callers that want to restrict to instant-buyout-from-online-seller can
       // pass onlineStatus: 'securable' explicitly.
@@ -544,6 +607,7 @@ export class TradeQueryBuilder {
    * Build and return the final query
    */
   build(): TradeQuery {
+    if (this.game === 'poe2') this.query.query.stats ??= [{type:'and',filters:[]}];
     return JSON.parse(JSON.stringify(this.query)); // Deep clone
   }
 

@@ -53,6 +53,7 @@ describe('buildCraftingResponse', () => {
 });
 
 describe('handleSuggestCrafting — graceful degradation', () => {
+  const originalGame = process.env.POE_GAME;
   const mockGetCurrencyExchangeMap = jest.fn<() => Promise<Map<string, number>>>();
 
   const mockNinjaClient = {
@@ -67,11 +68,14 @@ describe('handleSuggestCrafting — graceful degradation', () => {
   let fetchSpy: any;
 
   beforeEach(() => {
+    process.env.POE_GAME = 'poe1';
     fetchSpy = jest.spyOn(global, 'fetch' as any);
     jest.clearAllMocks();
   });
 
   afterEach(() => {
+    if (originalGame === undefined) delete process.env.POE_GAME;
+    else process.env.POE_GAME = originalGame;
     fetchSpy.mockRestore();
   });
 

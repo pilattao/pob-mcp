@@ -30,13 +30,22 @@ const derivedValidationFields = [
   'ReqStr','ReqDex','ReqInt','LifeCost','ManaCost','LifeUnreserved','ManaUnreserved',
   'SpiritUnreserved','NetManaRegen','FreezeAvoidChance','BleedAvoidChance','PoisonAvoidChance',
   'LifeRegenRecovery','LifeLeechGainRate','EnergyShieldRegenRecovery','EnergyShieldLeechGainRate',
-  'EnergyShieldRecharge','ManaRegenRecovery','DeflectChance',
+  'EnergyShieldRecharge','ManaRegenRecovery','DeflectChance','CharmLimit',
 ];
 const identity = (name: string) => name.replace(/\\/g, '/').replace(/\.xml$/i, '').toLowerCase();
 
 /** Read selected live state or one requested file; this function never opens/reloads/saves builds. */
 export async function readPoe2BuildEvidence(context: EvidenceContext, buildName?: string): Promise<PoE2BuildEvidence> {
-  const saved = buildName ? await context.buildService.readBuild(buildName) : undefined;
+  let saved: PoBBuild | undefined;
+  let missingFile: unknown;
+  if (buildName) {
+    try { saved = await context.buildService.readBuild(buildName); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
+      // Named unsaved PoB builds have no file. Native identity must still match.
+      missingFile = error;
+    }
+  }
   if (saved) check(saved);
   try { await context.ensureLuaClient?.(); } catch (error) { if (!saved) throw error; }
   const client = context.getLuaClient?.();
@@ -57,7 +66,7 @@ export async function readPoe2BuildEvidence(context: EvidenceContext, buildName?
       return { build, stats, source: 'live', note: 'Source: current PoB2 XML and native calculated outputs, including unsaved selections.' };
     } catch (error) { if (!saved) throw error; }
   }
-  if (!saved) throw new Error('No current live PoB2 build could be read; open a build or provide build_name');
+  if (!saved) throw missingFile ?? new Error('No current live PoB2 build could be read; open a build or provide build_name');
   return { build: saved, stats: fileStats(saved), source: 'file',
     note: matches ? 'Source: saved PoB2 XML. Current native state was unavailable; saved stats can be stale.'
       : 'Source: requested saved PoB2 XML. A different or unidentified live build is excluded.' };

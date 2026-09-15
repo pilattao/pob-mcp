@@ -1,13 +1,14 @@
 import { wrapHandler } from '../utils/errorHandling.js';
-import { TradeApiClient } from '../services/tradeClient.js';
+import { TradeApiClient, tradeSearchUrl, tradeGame } from '../services/tradeClient.js';
 import { TradeQueryBuilder } from '../services/tradeQueryBuilder.js';
 import { StatMapper } from '../services/statMapper.js';
-import { ItemRecommendationEngine, UpgradeContext } from '../services/itemRecommendationEngine.js';
+import { ItemRecommendationEngine, UpgradeContext, type ItemCandidateRecommendation } from '../services/itemRecommendationEngine.js';
 import { ItemListing, SearchOptions, ItemRecommendation, ResistanceRequirements, BudgetConstraints, TradeQuery } from '../types/tradeTypes.js';
 import { CostBenefitAnalyzer } from '../services/costBenefitAnalyzer.js';
-import { PoeNinjaClient } from '../services/poeNinjaClient.js';
+import { PoeNinjaClient, withCurrencyAliases } from '../services/poeNinjaClient.js';
 import type { AnyLuaClient } from '../pobLuaBridge.js';
 import { resolveLeague } from '../services/leagueResolver.js';
+import { prepareWeightedTradeQuery, validateWeightedTradeOptions } from '../services/weightedTradeQuery.js';
 
 interface TradeContext {
   tradeClient: TradeApiClient;
@@ -26,12 +27,12 @@ interface WeightedTradeContext extends TradeContext {
 // ========================================
 
 function getTradeSearchUrl(league: string, searchId: string): string {
-  return `https://www.pathofexile.com/trade/search/${encodeURIComponent(league)}/${searchId}`;
+  return tradeSearchUrl(league,searchId);
 }
 
 function getTradeItemUrl(league: string, searchId: string, itemId: string): string {
   // Individual items can be highlighted in the search results
-  return `https://www.pathofexile.com/trade/search/${encodeURIComponent(league)}/${searchId}#${itemId}`;
+  return `${tradeSearchUrl(league,searchId)}#${encodeURIComponent(itemId)}`;
 }
 
 // The MCP schema exposes `mods` with `stat_id` while the handler internally
@@ -65,6 +66,11 @@ export async function handleSearchTradeItems(
     rarity?: 'normal' | 'magic' | 'rare' | 'unique' | 'any';
     item_rarity?: 'normal' | 'magic' | 'rare' | 'unique' | 'any';
     min_links?: number;
+    min_rune_sockets?: number;
+    min_spirit?: number;
+    min_ward?: number;
+    corrupted?: boolean;
+    identified?: boolean;
     stats?: Array<{ id: string; min?: number; max?: number }>;
     mods?: Array<{ stat_id: string; min?: number; max?: number }>;
     sort?: 'price_asc' | 'price_desc';
@@ -111,10 +117,15 @@ export async function handleSearchTradeItems(
       builder.withRarity(effectiveRarity);
     }
 
-    if (min_links) {
+    if (min_links !== undefined) {
       builder.withLinks(min_links);
     }
 
+    if(args.min_rune_sockets!==undefined)builder.withRuneSockets(args.min_rune_sockets);
+    if(args.min_spirit!==undefined)builder.withSpirit(args.min_spirit);
+    if(args.min_ward!==undefined)builder.withWard(args.min_ward);
+    if(args.corrupted!==undefined)builder.withItemState('corrupted',args.corrupted);
+    if(args.identified!==undefined)builder.withItemState('identified',args.identified);
     const statFilters = toStatFilters(stats, mods);
     if (statFilters.length > 0) {
       builder.withStats(statFilters);
@@ -133,21 +144,29 @@ export async function handleSearchTradeItems(
 
     const query = builder.build();
 
-    // Execute search — one API call to get a searchId and total count.
-    // We deliberately do NOT fetch listings (no fetchItems call) to follow the
-    // ExileExchange pattern: return a URL for the user to open rather than
-    // programmatically pulling listing data. See legal_considerations.md §TOS.
+    if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new Error('limit must be an integer from 1 to 20');
     const searchResult = await context.tradeClient.searchItems(league, query);
-
-    if (!searchResult.result || searchResult.result.length === 0) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No items found matching your search criteria in ${league} league.`,
-          },
-        ],
-      };
+    if (searchResult.total === 0) {
+      return {content:[{type:'text',text:`No matching listings returned for ${league}.`} ]};
+    }
+    if (context.tradeClient.game === 'poe2') {
+      const wanted = searchResult.result.slice(0,limit);
+      const rows:ItemListing[]=[];
+      for(let start=0;start<wanted.length;start+=10) rows.push(...await context.tradeClient.fetchItems(wanted.slice(start,start+10),searchResult.id));
+      const matched=rows.filter(row=>row.item.league===league);
+      const lines=[`=== PoE2 Trade Search (${league}) ===`, `Source matches: ${searchResult.total}; fetched: ${matched.length}/${wanted.length}`,
+        `Search: ${getTradeSearchUrl(league,searchResult.id)}`,`Read at: ${new Date().toISOString()}`];
+      if(matched.length<rows.length)lines.push('Some fetched items no longer belong to the requested league and were excluded.');
+      for(const row of matched) {
+        const price=row.listing.price;
+        lines.push('',`## ${row.item.name || row.item.typeLine} (${row.item.typeLine})`,
+          `Price: ${price ? `${price.amount} ${price.currency}` : 'not listed'}`,`Item level: ${row.item.ilvl ?? 'unknown'}`,`Listing ID: ${row.id}`);
+        for(const key of ['implicitMods','explicitMods','enchantMods','runeMods','desecratedMods'] as const) {
+          for(const mod of (row.item as any)[key] ?? [])lines.push(`- ${mod}`);
+        }
+      }
+      lines.push('', 'Prices are the returned listing denominations. An explicit price currency filters those denominations; availability can change.');
+      return {content:[{type:'text',text:lines.join('\n')}]};
     }
 
     const url = getTradeSearchUrl(league, searchResult.id);
@@ -174,6 +193,9 @@ export async function handleGetItemPrice(
     league?: string;
     item_type?: string;
     rarity?: 'unique' | 'rare' | 'magic' | 'normal';
+    variant?: string;
+    corrupted?: boolean;
+    stats?: Array<{id:string;min?:number;max?:number}>;
   }
 ): Promise<{
   content: Array<{
@@ -185,30 +207,22 @@ export async function handleGetItemPrice(
     const { item_name, item_type, rarity } = args;
     const league = resolveLeague(args.league);
 
-    // For named items (uniques, currency, gems, div cards) prefer poe.ninja —
-    // zero GGG API calls. For rare/unknown items fall back to a trade URL.
-    // We deliberately do NOT fetch listings from the trade API; see legal_considerations.md §TOS.
     if (context.ninjaClient && (!rarity || rarity === 'unique')) {
-      try {
-        const ninjaRates = await context.ninjaClient.getCurrencyExchangeMap(league);
-        const ninjaPrice = ninjaRates.get(item_name);
-        if (ninjaPrice !== undefined) {
-          return {
-            content: [{
-              type: 'text',
-              text: `=== Price Check: ${item_name} (poe.ninja) ===\nLeague: ${league}\nPrice: ${ninjaPrice.toFixed(1)} chaos\nNote: This product is not affiliated with or endorsed by Grinding Gear Games.`,
-            }],
-          };
-        }
-      } catch {
-        // poe.ninja unavailable — fall through to trade URL
+      const price = await context.ninjaClient.getItemPrice(league,item_name,{variant:args.variant,corrupted:args.corrupted});
+      if (price.status !== 'not-found') {
+        return {content:[{type:'text',text:JSON.stringify({
+          ...price,
+          interpretation:'Aggregate source estimates. Variants and currencies remain separate; these are not exact-roll listing quotes.',
+        },null,2)}]};
       }
     }
 
     // Fall back: build trade URL (one search POST, no listing fetch)
-    const builder = new TradeQueryBuilder()
-      .withName(item_name)
-      .withOnlineStatus('available');
+    const builder = new TradeQueryBuilder().withOnlineStatus('available');
+    if(rarity && rarity !== 'unique') {
+      if(!item_type)throw new Error('Rare/magic/normal comparison requires item_type (base or category); generated item names do not determine market value');
+      if(args.stats?.length)builder.withStats(args.stats);
+    } else builder.withName(item_name);
 
     if (item_type) builder.withType(item_type);
     if (rarity) builder.withRarity(rarity);
@@ -224,6 +238,14 @@ export async function handleGetItemPrice(
     }
 
     const url = getTradeSearchUrl(league, searchResult.id);
+    if(context.tradeClient.game==='poe2') {
+      const rows=await context.tradeClient.fetchItems(searchResult.result.slice(0,10),searchResult.id);
+      return {content:[{type:'text',text:JSON.stringify({game:'poe2',league,query:item_name,
+        kind:rarity&&rarity!=='unique'?'comparable-listings':'listing-quotes',search:url,total:searchResult.total,
+        prices:rows.filter(row=>row.item.league===league).map(row=>({id:row.id,name:row.item.name,baseType:row.item.typeLine,price:row.listing.price??null})),
+        note:'These are returned listings matching the explicit filters, not a valuation of unseen rolls.',
+      },null,2)}]};
+    }
     return {
       content: [{
         type: 'text',
@@ -291,55 +313,9 @@ export async function handleGetLeagues(
  * Maps full currency names to short names used by trade API
  */
 async function getCurrencyRatesMap(ninjaClient: PoeNinjaClient | undefined, league: string): Promise<Map<string, number>> {
-  if (!ninjaClient) {
-    return new Map();
-  }
-
-  try {
-    const rates = await ninjaClient.getCurrencyExchangeMap(league);
-
-    // Map poe.ninja names to trade API currency names
-    const mappedRates = new Map<string, number>();
-
-    // Common currency mappings
-    const nameMap: Record<string, string[]> = {
-      'Divine Orb': ['divine', 'div'],
-      'Chaos Orb': ['chaos', 'c'],
-      'Exalted Orb': ['exalted', 'exa', 'ex'],
-      'Mirror of Kalandra': ['mirror'],
-      'Orb of Alchemy': ['alchemy', 'alch'],
-      'Orb of Fusing': ['fusing', 'fuse'],
-      'Orb of Regret': ['regret'],
-      'Gemcutter\'s Prism': ['gcp'],
-      'Chromatic Orb': ['chrome', 'chromatic'],
-      'Jeweller\'s Orb': ['jewellers', 'jew'],
-      'Orb of Alteration': ['alt', 'alteration'],
-      'Vaal Orb': ['vaal'],
-      'Cartographer\'s Chisel': ['chisel'],
-      'Blessed Orb': ['blessed'],
-      'Orb of Scouring': ['scouring', 'scour'],
-    };
-
-    // Add mappings
-    for (const [fullName, chaosValue] of rates.entries()) {
-      // Add the full name
-      mappedRates.set(fullName, chaosValue);
-
-      // Add short name mappings
-      for (const [key, aliases] of Object.entries(nameMap)) {
-        if (fullName === key) {
-          for (const alias of aliases) {
-            mappedRates.set(alias, chaosValue);
-          }
-        }
-      }
-    }
-
-    return mappedRates;
-  } catch (error) {
-    console.error('[Trade] Failed to fetch currency rates from poe.ninja:', error);
-    return new Map();
-  }
+  if (!ninjaClient) return new Map();
+  const rates = await ninjaClient.getCurrencyExchangeMap(league);
+  return withCurrencyAliases(rates);
 }
 
 async function formatSearchResults(items: ItemListing[], totalResults: number, league: string, searchId: string, ninjaClient?: PoeNinjaClient): Promise<string> {
@@ -373,7 +349,8 @@ async function formatSearchResults(items: ItemListing[], totalResults: number, l
       'excellent': ' 💎',
       'good': ' ✨',
       'average': '',
-      'poor': ' ⚠️'
+      'poor': ' ⚠️',
+      'unknown': ' ?'
     }[metrics.valueTier];
     output += tierEmoji;
 
@@ -389,7 +366,7 @@ async function formatSearchResults(items: ItemListing[], totalResults: number, l
 
     if (price) {
       output += `   Price: ${price.amount} ${price.currency}`;
-      if (analysis.priceInChaos > 0 && price.currency !== 'chaos') {
+      if (analysis.priceInChaos !== undefined && analysis.priceInChaos > 0 && price.currency !== 'chaos') {
         output += ` (~${analysis.priceInChaos.toFixed(0)} chaos)`;
       }
       output += `\n`;
@@ -398,7 +375,7 @@ async function formatSearchResults(items: ItemListing[], totalResults: number, l
     }
 
     // Show value score
-    output += `   Value: ${metrics.valueScore.toFixed(0)}/100 (${metrics.valueTier})`;
+    output += `   Value: ${metrics.valueScore === undefined ? 'unknown' : metrics.valueScore.toFixed(0) + '/100'} (${metrics.valueTier})`;
     if (valueRank <= 3) {
       output += ` - #${valueRank} best value`;
     }
@@ -476,6 +453,7 @@ export async function handleSearchStats(
       };
     }
 
+    if (context.tradeClient.game === 'poe2') await context.statMapper.loadFromTradeAPI(await context.tradeClient.getStats());
     const results = context.statMapper.fuzzySearch(query, limit);
 
     if (results.length === 0) {
@@ -562,6 +540,7 @@ export async function handleFindItemUpgrades(
           chaos: current_item.chaos_resist,
         },
       } : undefined,
+      itemRequirements: args.item_requirements,
       buildNeeds: {
         lifeNeeded: build_needs?.life,
         esNeeded: build_needs?.es,
@@ -612,10 +591,10 @@ export async function handleFindResistanceGear(
       limit = 8,
     } = args;
 
+    if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new Error('limit must be an integer from 1 to 20');
+
     if (!context.recommendationEngine) {
-      return {
-        content: [{ type: 'text', text: 'Recommendation engine not available.' }],
-      };
+      throw new Error('Recommendation engine not available.');
     }
 
     const resistanceGaps: ResistanceRequirements = {
@@ -649,6 +628,22 @@ export async function handleFindResistanceGear(
   });
 }
 
+function formatCandidateEvidence(rec: ItemRecommendation): string {
+  const candidate = rec as Partial<ItemCandidateRecommendation>;
+  const evidence = candidate.itemEvidence;
+  const lines: string[] = [];
+  if (evidence) {
+    lines.push(`   Observed item contributions: ${JSON.stringify(Object.fromEntries(evidence.knownStats.map(key => [key, (evidence.stats as any)[key]])))}`);
+    if (evidence.unparsedMods.length) lines.push(`   Mods not included in local scoring: ${evidence.unparsedMods.join('; ')}`);
+    if (rec.statComparison) lines.push(`   Item contribution changes: ${JSON.stringify(rec.statComparison.delta)}`);
+  }
+  const cost = candidate.costBenefit;
+  if (cost?.priceInBudgetCurrency !== undefined) lines.push(`   Reference budget value: ${cost.priceInBudgetCurrency} ${cost.budgetCurrency}`);
+  for (const warning of rec.warnings ?? []) lines.push(`   ${warning}`);
+  if (rec.listing.listing.indexed) lines.push(`   Listing indexed: ${rec.listing.listing.indexed}`);
+  return lines.length ? lines.join('\n') + '\n' : '';
+}
+
 function formatItemRecommendations(
   recommendations: ItemRecommendation[],
   slot: string,
@@ -670,7 +665,7 @@ function formatItemRecommendations(
       output += `   Base: ${item.typeLine}\n`;
     }
 
-    output += `   Score: ${rec.score.toFixed(1)}/100 (${rec.priority} priority)\n`;
+    output += `   Candidate fit score: ${rec.score.toFixed(1)}/100 (${rec.priority} priority)\n`;
 
     if (price) {
       output += `   Price: ${price.amount} ${price.currency}\n`;
@@ -679,10 +674,10 @@ function formatItemRecommendations(
     if (rec.costBenefit) {
       const cb = rec.costBenefit;
       if (cb.lifeGain && cb.lifeGain > 0) {
-        output += `   Life Gain: +${cb.lifeGain}\n`;
+        output += `   Item Life delta: +${cb.lifeGain}\n`;
       }
       if (cb.esGain && cb.esGain > 0) {
-        output += `   ES Gain: +${cb.esGain}\n`;
+        output += `   Item ES delta: +${cb.esGain}\n`;
       }
       if (cb.efficiency) {
         output += `   Efficiency: ${cb.efficiency.toFixed(2)} points per ${cb.currency}\n`;
@@ -696,6 +691,7 @@ function formatItemRecommendations(
       }
     }
 
+    output += formatCandidateEvidence(rec);
     output += `   ${rec.listing.listing.account.online ? '🟢' : '🔴'} ${rec.listing.listing.account.name}\n`;
     output += `   🔗 ${getTradeItemUrl(league, rec.searchId, rec.listing.id)}\n\n`;
   }
@@ -731,7 +727,7 @@ function formatResistanceRecommendations(
       output += `   Type: ${item.typeLine}\n`;
     }
 
-    output += `   Score: ${rec.score.toFixed(1)}/100 (${rec.priority} priority)\n`;
+    output += `   Candidate fit score: ${rec.score.toFixed(1)}/100 (${rec.priority} priority)\n`;
 
     if (price) {
       output += `   Price: ${price.amount} ${price.currency}\n`;
@@ -761,6 +757,7 @@ function formatResistanceRecommendations(
       }
     }
 
+    output += formatCandidateEvidence(rec);
     output += `   ${rec.listing.listing.account.online ? '🟢' : '🔴'} ${rec.listing.listing.account.name}\n`;
     output += `   🔗 ${getTradeItemUrl(league, rec.searchId, rec.listing.id)}\n\n`;
   }
@@ -775,6 +772,8 @@ export async function handleCompareTradeItems(
   context: TradeContext,
   args: {
     item_ids: string[];
+    query_id?: string;
+    league?: string;
     build_context?: {
       life_needed?: number;
       es_needed?: number;
@@ -805,7 +804,7 @@ export async function handleCompareTradeItems(
       };
     }
 
-    const items = await context.tradeClient.fetchItems(item_ids);
+    const items = await context.tradeClient.fetchItems(item_ids,args.query_id);
 
     if (items.length === 0) {
       return {
@@ -813,6 +812,20 @@ export async function handleCompareTradeItems(
       };
     }
 
+    if(context.tradeClient.game==='poe2') {
+      const leagues=new Set(items.map(row=>row.item.league));
+      const league=args.league??(leagues.size===1?[...leagues][0]:undefined);
+      if(!league || items.some(row=>row.item.league!==league))throw new Error('Comparison items must belong to the requested single PoE2 league');
+      const rates=await getCurrencyRatesMap(context.ninjaClient,league);
+      const analyzer=new CostBenefitAnalyzer();
+      const evidence=items.map(item=>analyzer.analyzeItem(item,rates));
+      return {content:[{type:'text',text:JSON.stringify({game:'poe2',league,scope:'item-evidence',
+        items:evidence.map(row=>({id:row.listing.id,name:row.listing.item.name,baseType:row.listing.item.typeLine,
+          price:row.priceEvidence,stats:Object.fromEntries(row.knownStats.map(key=>[key,(row.stats as any)[key]])),
+          unparsedMods:row.unparsedMods,warnings:row.metrics.warnings})),
+        buildContext:build_context??null,note:'Displayed item stats and reference price conversions are not build DPS/EHP or a guarantee that the item can be equipped.',
+      },null,2)}]};
+    }
     const output = formatItemComparison(items, build_context);
     return { content: [{ type: 'text', text: output }] };
   });
@@ -998,9 +1011,8 @@ function extractResistValue(item: any, element: string): number {
 }
 
 /**
- * Find best-in-slot trade items for the loaded PoB build using PoB's
- * TradeQueryGenerator weighted-search engine. Generates a query JSON keyed by
- * real DPS/eHP impact for the build, then executes it against the PoE trade API.
+ * Execute the loaded build's native weighted query and fetch a bounded listing
+ * sample in source order. Search weights do not establish per-item DPS or value.
  */
 export async function handleFindWeightedTradeItems(
   context: WeightedTradeContext,
@@ -1013,47 +1025,55 @@ export async function handleFindWeightedTradeItems(
 ): Promise<{ content: Array<{ type: string; text: string }> }> {
   return wrapHandler('find weighted trade items', async () => {
     const { league, slot, options, limit = 5 } = args;
-    if (!league) throw new Error('league is required');
-    if (!slot) throw new Error('slot is required (e.g. "Belt", "Ring 1", "Body Armour")');
+    if (typeof league !== 'string' || !league.trim() || league !== league.trim()) throw new Error('An exact league is required');
+    if (typeof slot !== 'string' || !slot.trim()) throw new Error('slot is required (e.g. "Belt", "Ring 1", "Body Armour")');
+    if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new Error('limit must be an integer from 1 to 20');
+    validateWeightedTradeOptions(options);
 
     await context.ensureLuaClient();
     const luaClient = context.getLuaClient();
     if (!luaClient) throw new Error('Lua client not initialized — load a build first');
 
     const { query: pobQuery, warning } = await luaClient.generateWeightedTradeQuery(slot, options);
-    if (!pobQuery || typeof pobQuery !== 'object') {
-      throw new Error(`PoB returned no query JSON${warning ? ` (${warning})` : ''}`);
+    const game = context.tradeClient.game;
+    const prepared = prepareWeightedTradeQuery(pobQuery, game);
+    const searchResult = await context.tradeClient.searchItems(league, prepared.query);
+    const wanted = [...new Set(searchResult.result.slice(0, limit))];
+    const fetched: ItemListing[] = [];
+    for (let start = 0; start < wanted.length; start += 10) {
+      fetched.push(...await context.tradeClient.fetchItems(wanted.slice(start, start + 10), searchResult.id));
     }
-
-    // PoB's TradeQueryGenerator may produce a status value the trade API rejects.
-    // Override to a known-good value before submitting.
-    const normalizedQuery = pobQuery as Record<string, any>;
-    if (normalizedQuery.query) {
-      normalizedQuery.query.status = { option: 'online' };
+    const byId = new Map(fetched.filter(row => row.item.league === league && wanted.includes(row.id)).map(row => [row.id, row]));
+    const items = wanted.flatMap(id => byId.has(id) ? [byId.get(id)!] : []);
+    const url = tradeSearchUrl(league, searchResult.id, game);
+    const apiPath = game === 'poe2' ? 'trade2/search/poe2' : 'trade/search';
+    const lines = [`=== Weighted Trade Search (${league}, slot: ${slot}) ===`,
+      `Game: ${game}`, `Query ID: ${searchResult.id}`,
+      `Source: https://www.pathofexile.com/api/${apiPath}/${encodeURIComponent(league)}`,
+      `Search: ${url}`, `Read at: ${new Date().toISOString()}`,
+      `Total source matches: ${searchResult.total}${searchResult.inexact ? ' (inexact)' : ''}`,
+      `Requested listing IDs: ${wanted.length}; displayed: ${items.length}; limit: ${limit}`,
+      `Active weighted mods: ${prepared.weightedMods}`];
+    if (warning) lines.push(`PoB warning: ${warning}`);
+    lines.push(...prepared.changes);
+    const priceFilter = prepared.query.query.filters?.trade_filters?.filters?.price;
+    if (priceFilter?.option) lines.push(`Price option: ${priceFilter.option}. A currency denomination filter selects listings in that denomination; it is not a converted budget across currencies.`);
+    if (!wanted.length) lines.push('No matching listings returned by the source.');
+    else if (items.length < wanted.length) lines.push(`${wanted.length - items.length} requested listings were unavailable or excluded because their league did not match; no replacement search was made.`);
+    for (const [index, row] of items.entries()) {
+      const price = row.listing.price;
+      const priceText = price && Number.isFinite(price.amount) && price.amount >= 0 && typeof price.currency === 'string' && price.currency.trim() ?
+        `${price.amount} ${price.currency}` : 'not listed';
+      lines.push('', `${index + 1}. ${row.item.name || row.item.typeLine}`,
+        `Base: ${row.item.typeLine}`, `League: ${row.item.league}`, `Price: ${priceText}`,
+        `Item level: ${row.item.ilvl ?? 'unknown'}`, `Listing ID: ${row.id}`,
+        `Indexed at source: ${row.listing.indexed ?? 'unknown'}`, `Listing: ${url}#${encodeURIComponent(row.id)}`);
+      for (const mods of [row.item.implicitMods, row.item.explicitMods, row.item.craftedMods, row.item.enchantMods, row.item.fracturedMods]) {
+        if (Array.isArray(mods)) lines.push(...mods.filter(mod => typeof mod === 'string'));
+      }
     }
-    const searchResult = await context.tradeClient.searchItems(league, normalizedQuery as unknown as TradeQuery);
-
-    if (!searchResult.result || searchResult.result.length === 0) {
-      const empty =
-        `=== Weighted BIS Search (${league}, slot: ${slot}) ===\n` +
-        `No items found.\n` +
-        (warning ? `Warning: ${warning}\n` : '') +
-        `Query had ${(pobQuery as any)?.query?.stats?.[0]?.filters?.length ?? '?'} weighted mods.\n`;
-      return { content: [{ type: 'text', text: empty }] };
-    }
-
-    // Return the trade URL only — do NOT fetch listings. This follows the
-    // ExileExchange pattern (one search POST → URL returned to user) and avoids
-    // the chained-fetch pattern GGG objects to. See legal_considerations.md §TOS.
-    const url = getTradeSearchUrl(league, searchResult.id);
-    let output = `=== Weighted BIS Search (${league}, slot: ${slot}) ===\n`;
-    output += `Total matches: ${searchResult.total}\n`;
-    if (warning) output += `Warning: ${warning}\n`;
-    output += `\n🔗 ${url}\n`;
-    output += `\nQuery weighted by PoB's TradeQueryGenerator for your loaded build.\n`;
-    output += `Open the link above to browse results on the trade site.\n`;
-    output += `Note: This product is not affiliated with or endorsed by Grinding Gear Games.`;
-
-    return { content: [{ type: 'text', text: output }] };
+    lines.push('', 'Listings retain the weighted search order. Asking prices and generated weights do not establish item-specific DPS/EHP gains, market valuation or completed sales.',
+      'Read-only search; no trades or messages were sent. This product is not affiliated with or endorsed by Grinding Gear Games.');
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
   });
 }

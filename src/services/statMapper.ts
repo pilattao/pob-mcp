@@ -1,3 +1,4 @@
+import { tradeGame } from './tradeClient.js';
 /**
  * Stat Mapping System
  *
@@ -8,7 +9,7 @@
 export interface StatMapping {
   pobName: string;
   tradeId: string;
-  category: 'pseudo' | 'explicit' | 'implicit' | 'enchant' | 'crafted' | 'fractured';
+  category: 'pseudo' | 'explicit' | 'implicit' | 'enchant' | 'crafted' | 'fractured' | 'augment' | 'desecrated' | 'sanctum' | 'skill' | (string & {});
   aliases: string[];
   description?: string;
 }
@@ -420,6 +421,7 @@ export const STAT_MAPPINGS: StatMapping[] = [
  * Service for mapping between PoB stats and Trade API stat IDs
  */
 export class StatMapper {
+  private readonly game=tradeGame();
   private mappingsByPobName: Map<string, StatMapping>;
   private mappingsByTradeId: Map<string, StatMapping>;
   private allAliases: Map<string, StatMapping>;
@@ -432,7 +434,7 @@ export class StatMapper {
     this.allAliases = new Map();
 
     // Initialize with static mappings as fallback
-    this.loadStaticMappings();
+    if (this.game === 'poe1') this.loadStaticMappings();
   }
 
   /**
@@ -450,6 +452,10 @@ export class StatMapper {
    * Load stats dynamically from official PoE trade API data
    */
   async loadFromTradeAPI(statData: any): Promise<void> {
+    if (!Array.isArray(statData?.result) || !statData.result.length || statData.result.some((g:any)=>
+      typeof g.label !== 'string' || !Array.isArray(g.entries) || g.entries.some((e:any)=>typeof e.id!=='string'||typeof e.text!=='string'))) {
+      throw new Error('Invalid trade stat metadata; mappings were not replaced');
+    }
     // Clear existing mappings
     this.mappingsByPobName.clear();
     this.mappingsByTradeId.clear();
@@ -476,6 +482,35 @@ export class StatMapper {
       }
     }
 
+    // Aliases require both the observed ID and its meaning. Raw stat IDs remain
+    // usable for every definition; unknown/ambiguous output-stat aliases do not.
+    const aliases = this.game === 'poe2' ? [
+      ['Life','pseudo.pseudo_total_life','total maximum life'],
+      ['EnergyShield','pseudo.pseudo_total_energy_shield','total maximum energy shield'],
+      ['Mana','pseudo.pseudo_total_mana','total maximum mana'],
+      ['FireResist','pseudo.pseudo_total_fire_resistance','total to fire resistance'],
+      ['ColdResist','pseudo.pseudo_total_cold_resistance','total to cold resistance'],
+      ['LightningResist','pseudo.pseudo_total_lightning_resistance','total to lightning resistance'],
+      ['ChaosResist','pseudo.pseudo_total_chaos_resistance','total to chaos resistance'],
+      ['AllResist','pseudo.pseudo_total_resistance','total resistance'],
+      ['Str','pseudo.pseudo_total_strength','total to strength'],
+      ['Dex','pseudo.pseudo_total_dexterity','total to dexterity'],
+      ['Int','pseudo.pseudo_total_intelligence','total to intelligence'],
+      ['Spirit','explicit.stat_3981240776','to spirit'],
+      ['CastSpeed','explicit.stat_2891184298','increased cast speed'],
+      ['SpellSkillLevel','explicit.stat_124131830','to level of all spell skills'],
+      ['CriticalDamageBonusIncrease','explicit.stat_3556824919','increased critical damage bonus'],
+    ] : [];
+    for (const [name,id,meaning] of aliases) {
+      const record=this.mappingsByTradeId.get(id);
+      if(!record || record.description?.toLowerCase().replace(/^[+#%\s]+/,'').trim() !== meaning)continue;
+      record.pobName=name;record.aliases.push(name);
+      this.addMapping(record);
+    }
+    if(this.game==='poe1') for(const legacy of STAT_MAPPINGS) {
+      const record=this.mappingsByTradeId.get(legacy.tradeId.toLowerCase());
+      if(record){record.pobName=legacy.pobName;record.aliases.push(...legacy.aliases);this.addMapping(record);}
+    }
     this.loaded = true;
     console.error(`[StatMapper] Loaded ${this.allStats.length} stats from trade API`);
   }
@@ -483,15 +518,11 @@ export class StatMapper {
   /**
    * Determine category type from API label
    */
-  private getCategoryType(label: string): 'pseudo' | 'explicit' | 'implicit' | 'enchant' | 'crafted' | 'fractured' {
-    const lowerLabel = label.toLowerCase();
-    if (lowerLabel.includes('pseudo')) return 'pseudo';
-    if (lowerLabel.includes('explicit')) return 'explicit';
-    if (lowerLabel.includes('implicit')) return 'implicit';
-    if (lowerLabel.includes('enchant')) return 'enchant';
-    if (lowerLabel.includes('crafted')) return 'crafted';
-    if (lowerLabel.includes('fractured')) return 'fractured';
-    return 'explicit'; // Default
+  private getCategoryType(label: string): StatMapping['category'] {
+    const value=label.toLowerCase();
+    const known:StatMapping['category'][]=['pseudo','explicit','implicit','enchant','crafted','fractured','augment','desecrated','sanctum','skill'];
+    if(known.includes(value as StatMapping['category']))return value as StatMapping['category'];
+    return value; // Preserve new official categories rather than calling them explicit.
   }
 
   /**
@@ -511,8 +542,11 @@ export class StatMapper {
    * Get Trade API stat ID from PoB stat name
    */
   getTradeId(pobStatName: string): string | null {
-    const mapping = this.mappingsByPobName.get(pobStatName.toLowerCase());
-    return mapping ? mapping.tradeId : null;
+    const key=pobStatName.toLowerCase();
+    const mapping = this.mappingsByPobName.get(key) ?? this.mappingsByTradeId.get(key);
+    if(mapping)return mapping.tradeId;
+    const matches=this.allStats.filter(m=>m.aliases.some(alias=>alias.toLowerCase()===key));
+    return matches.length===1?matches[0].tradeId:null;
   }
 
   /**
@@ -593,14 +627,14 @@ export class StatMapper {
    * Get all mappings in a category
    */
   getByCategory(category: StatMapping['category']): StatMapping[] {
-    return STAT_MAPPINGS.filter(m => m.category === category);
+    return this.allStats.filter(m => m.category === category);
   }
 
   /**
    * Get all mappings
    */
   getAllMappings(): StatMapping[] {
-    return [...STAT_MAPPINGS];
+    return [...this.allStats];
   }
 
   /**
@@ -631,6 +665,8 @@ export class StatMapper {
       const filter = this.pobStatToTradeFilter(stat.name, stat.min, stat.max);
       if (filter) {
         results.push(filter);
+      } else if (this.game === 'poe2') {
+        throw new Error(`Unsupported or unmapped PoE2 trade stat: ${stat.name}. Select an exact ID from search_stats.`);
       }
     }
 

@@ -14,6 +14,7 @@ describe('PoE2 evidence source selection',()=>{
   client.getStats.mockImplementation(async (fields?:string[])=>fields?{MissingChaosResist:36}:{Life:2502,ChaosResist:39});
   const result=await readPoe2BuildEvidence({buildService:service,getLuaClient:()=>client as any});
   expect(result.stats.ChaosResist).toBe(39);expect(result.stats.MissingChaosResist).toBe(36);
+  expect(client.getStats).toHaveBeenCalledWith(expect.arrayContaining(['CharmLimit']));
  });
 
  it('initializes and reads the live XML without saving or loading a build',async()=>{
@@ -37,6 +38,19 @@ describe('PoE2 evidence source selection',()=>{
  it('does not replace a missing requested file with unrelated live data',async()=>{
   const {service,client}=fixture();jest.spyOn(service,'readBuild').mockRejectedValue(new Error('missing'));
   await expect(readPoe2BuildEvidence({buildService:service,getLuaClient:()=>client as any},'Absent.xml')).rejects.toThrow('missing');
+ });
+ it('accepts the exact named unsaved build when no file exists',async()=>{
+  const {service,client}=fixture();
+  jest.spyOn(service,'readBuild').mockRejectedValue(Object.assign(new Error('missing file'),{code:'ENOENT'}));
+  const result=await readPoe2BuildEvidence({buildService:service,getLuaClient:()=>client as any},'Loaded.xml');
+  expect(result.source).toBe('live');expect(result.stats.Life).toBe(2600);
+  expect(client.loadBuildXml).not.toHaveBeenCalled();
+ });
+ it('preserves a missing-file error when a different native build is open',async()=>{
+  const {service,client}=fixture();
+  jest.spyOn(service,'readBuild').mockRejectedValue(Object.assign(new Error('missing requested file'),{code:'ENOENT'}));
+  await expect(readPoe2BuildEvidence({buildService:service,getLuaClient:()=>client as any},'Other.xml')).rejects.toThrow('missing requested file');
+  expect(client.exportBuildXml).not.toHaveBeenCalled();
  });
  it('fails clearly when no file or live source exists',async()=>{
   const {service}=fixture();await expect(readPoe2BuildEvidence({buildService:service,getLuaClient:()=>null})).rejects.toThrow(/live/i);

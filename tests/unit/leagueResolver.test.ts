@@ -9,8 +9,11 @@ import {
 
 describe('leagueResolver', () => {
   const originalEnv = process.env.POE_LEAGUE;
+  const originalGame = process.env.POE_GAME;
+  beforeEach(()=>{process.env.POE_GAME='poe1';});
 
   afterEach(() => {
+    if(originalGame===undefined)delete process.env.POE_GAME;else process.env.POE_GAME=originalGame;
     if (originalEnv === undefined) delete process.env.POE_LEAGUE;
     else process.env.POE_LEAGUE = originalEnv;
   });
@@ -126,4 +129,12 @@ describe('leagueResolver', () => {
       expect(c.parent).toBe('Standard');
     });
   });
+});
+
+
+describe('explicit PoE2 league selection',()=>{
+  const game=process.env.POE_GAME,league=process.env.POE_LEAGUE;
+  afterEach(()=>{if(game===undefined)delete process.env.POE_GAME;else process.env.POE_GAME=game;if(league===undefined)delete process.env.POE_LEAGUE;else process.env.POE_LEAGUE=league;});
+  it('never silently chooses Standard without a league',()=>{process.env.POE_GAME='poe2';delete process.env.POE_LEAGUE;expect(()=>resolveLeague()).toThrow(/explicit PoE2 league/);});
+  it('recognizes the actual HC prefix',()=>{expect(classifyLeague('HC Forbidden Rites').isHardcore).toBe(true);});
 });

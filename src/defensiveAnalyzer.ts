@@ -1,3 +1,219 @@
+import type { PoBBuild, ValidationIssue } from './types.js';
+import { validationStat } from './services/passiveBudget.js';
+import { ValidationService } from './services/validationService.js';
+
+type DefenseField = readonly [key: string, label: string, unit?: string];
+const poe2DamageTypes = ['Physical', 'Fire', 'Cold', 'Lightning', 'Chaos'] as const;
+const poe2ResistanceTypes = ['Fire', 'Cold', 'Lightning', 'Chaos'] as const;
+
+/** Output keys verified against installed PoB2 Modules/CalcDefence.lua and
+ * CalcOffence.lua. Missing outputs remain unknown, including on older runtimes. */
+const poe2DefenseSections: ReadonlyArray<{ title: string; fields: readonly DefenseField[]; note: string }> = [
+  {
+    title: 'Resource pools',
+    fields: [
+      ['Life', 'Life'], ['LifeUnreserved', 'Life unreserved'], ['LifeRecoverable', 'Life recoverable'],
+      ['EnergyShield', 'Energy Shield'], ['EnergyShieldRecoveryCap', 'Energy Shield recovery cap'],
+      ['Mana', 'Mana'], ['ManaUnreserved', 'Mana unreserved'], ['Ward', 'Ward'],
+    ],
+    note: 'Pools are separate resources. Their contributions depend on damage type, bypass, reservation and damage routing; adding them does not establish effective hit points.',
+  },
+  {
+    title: 'Maximum hit and effective hit points',
+    fields: [
+      ['TotalEHP', 'Native TotalEHP'],
+      ...poe2DamageTypes.map(type => [type + 'MaximumHitTaken', type + ' maximum hit'] as const),
+    ],
+    note: 'TotalEHP is the native configured repeated-hit calculation. Maximum hit is a separate per-damage-type result; neither establishes damage-over-time survival or encounter viability. No replacement EHP estimate is calculated.',
+  },
+  {
+    title: 'Mitigation and damage routing',
+    fields: [
+      ['Armour', 'Armour'], ['PhysicalDamageReduction', 'Physical damage reduction', '%'],
+      ['sharedMindOverMatter', 'Shared damage taken from mana before life', '%'],
+      ...poe2DamageTypes.map(type => [type + 'TotalPool', type + ' native pool'] as const),
+      ...poe2DamageTypes.map(type => [type + 'EnergyShieldBypass', type + ' Energy Shield bypass', '%'] as const),
+    ],
+    note: 'Native pools and maximum-hit outputs account for the configured routing. Armour and physical reduction depend on the incoming hit; a single reduction value is not a universal multiplier.',
+  },
+  {
+    title: 'Avoidance and deflection',
+    fields: [
+      ['Evasion', 'Evasion rating'], ['EvadeChance', 'Evade chance', '%'],
+      ['ConfiguredEvadeChance', 'Configured evade chance', '%'],
+      ['MeleeEvadeChance', 'Melee evade chance', '%'], ['ProjectileEvadeChance', 'Projectile evade chance', '%'],
+      ['SpellEvadeChance', 'Spell evade chance', '%'], ['SpellProjectileEvadeChance', 'Spell projectile evade chance', '%'],
+      ['BlockChance', 'Block chance', '%'], ['EffectiveBlockChance', 'Effective block chance', '%'],
+      ['EffectiveProjectileBlockChance', 'Effective projectile block chance', '%'],
+      ['EffectiveSpellBlockChance', 'Effective spell block chance', '%'],
+      ['EffectiveSpellProjectileBlockChance', 'Effective spell projectile block chance', '%'],
+      ['DeflectChance', 'Deflect chance', '%'], ['DeflectEffect', 'Deflect effect', '%'],
+    ],
+    note: 'These are native chances for the configured enemy and hit type. Deflection reduces a hit rather than avoiding it. Evasion rating is not converted into an estimated chance; effective block is kept separate from sheet block.',
+  },
+  {
+    title: 'Recovery and selected-skill resource pressure',
+    fields: [
+      ['LifeRegenRecovery', 'Life regeneration/recovery', '/s'],
+      ['LifeLeechGainRate', 'Life leech and on-hit gain', '/s'],
+      ['EnergyShieldRegenRecovery', 'Energy Shield regeneration/recovery', '/s'],
+      ['EnergyShieldLeechGainRate', 'Energy Shield leech and on-hit gain', '/s'],
+      ['EnergyShieldRecharge', 'Energy Shield recharge', '/s'],
+      ['EnergyShieldRechargeDelay', 'Energy Shield recharge delay', 's'],
+      ['ManaRegenRecovery', 'Mana regeneration/recovery', '/s'],
+      ['ManaLeechGainRate', 'Mana leech and on-hit gain', '/s'],
+      ['WardRechargeDelay', 'Ward recharge delay', 's'],
+      ['NetLifeRegen', 'Net life recovery', '/s'], ['NetEnergyShieldRegen', 'Net Energy Shield recovery', '/s'],
+      ['NetManaRegen', 'Net mana recovery', '/s'],
+      ['LifeCost', 'Selected skill life cost'], ['ManaCost', 'Selected skill mana cost'],
+    ],
+    note: 'Leech and on-hit gain depend on the selected skill connecting and its use rate. Recharge depends on its delay, interruptions and resource destination. Rates are not added together or treated as permanent recovery; zero and negative outputs are retained.',
+  },
+  {
+    title: 'Native enemy damage inputs',
+    fields: [
+      ['totalEnemyDamageIn', 'Total enemy damage input'],
+      ...poe2DamageTypes.map(type => [type + 'EnemyDamage', type + ' enemy damage'] as const),
+    ],
+    note: 'These are the native enemy inputs for this configuration, not an observed encounter or a guaranteed enemy hit size.',
+  },
+];
+
+// The handler requests these within readPoe2BuildEvidence's identity guard.
+export const POE2_DEFENSE_FIELDS: readonly string[] = [
+  ...poe2DefenseSections.flatMap(section => section.fields.map(([key]) => key)),
+  ...poe2ResistanceTypes.flatMap(type => [type + 'Resist', 'Missing' + type + 'Resist', type + 'ResistOverCap']),
+  'EnergyShieldRechargeAppliesToLife', 'EnergyShieldRechargeAppliesToEnergyShield',
+];
+
+export interface PoE2DefensiveAnalysis {
+  game: 'poe2';
+  overallScore: null;
+  stats: Record<string, number | null>;
+  resistances: Array<{ type: string; value: number | null; missing: number | null; cap: number | null; overCap: number | null }>;
+  lowestMaximumHit: { types: string[]; value: number; measuredTypes: number } | null;
+  rechargeAppliesToLife: boolean | null;
+  rechargeAppliesToEnergyShield: boolean | null;
+  configuration: string[];
+  findings: ValidationIssue[];
+}
+
+/** PoE2 has no fixed life target or defense score here. Only native outputs and
+ * the existing PoE2 validator establish findings; unobserved defenses are unknown. */
+export function analyzePoe2Defenses(stats: Record<string, unknown>, build: PoBBuild): PoE2DefensiveAnalysis {
+  if (build.__xmlRoot !== 'PathOfBuilding2') throw new Error('PoE2 defense analysis requires PathOfBuilding2 XML');
+  const measured = Object.fromEntries(POE2_DEFENSE_FIELDS.map(key => [key, validationStat(stats, key)]));
+  const resistances = poe2ResistanceTypes.map(type => {
+    const value = measured[type + 'Resist'];
+    const missing = measured['Missing' + type + 'Resist'];
+    return { type, value, missing, overCap: measured[type + 'ResistOverCap'],
+      cap: value !== null && missing !== null && missing >= 0 ? value + missing : null };
+  });
+  const maxHits = poe2DamageTypes.flatMap(type => {
+    const value = measured[type + 'MaximumHitTaken'];
+    return value !== null && value >= 0 ? [{ type, value }] : [];
+  });
+  const minimum = maxHits.length ? Math.min(...maxHits.map(hit => hit.value)) : null;
+  const validation = new ValidationService().validateBuild(build, null, stats);
+  const findings = [...validation.criticalIssues, ...validation.warnings, ...validation.recommendations]
+    .filter(issue => ['resistances', 'defenses', 'mana', 'immunities'].includes(issue.category) && issue.title !== 'Native Defense Evidence');
+  for (const [resource, label] of [['Life', 'Life'], ['EnergyShield', 'Energy Shield'], ['Mana', 'Mana']]) {
+    const value = measured[resource + 'RegenRecovery'];
+    if (value !== null && value < 0) {
+      findings.push({ severity: 'warning', category: 'defenses', title: `${label} recovery deficit`,
+        description: `Native ${resource}RegenRecovery is ${value}/s in this configuration. Conditional recovery may offset it only while its conditions hold.`,
+        suggestions: ['Inspect the native recovery and degeneration breakdown, then compare recovery during the intended encounter.'] });
+    }
+  }
+  const priority = { critical: 0, warning: 1, info: 2 };
+  findings.sort((a, b) => priority[a.severity] - priority[b.severity]);
+  return {
+    game: 'poe2', overallScore: null, stats: measured, resistances,
+    lowestMaximumHit: minimum === null ? null : { types: maxHits.filter(hit => hit.value === minimum).map(hit => hit.type), value: minimum, measuredTypes: maxHits.length },
+    rechargeAppliesToLife: typeof stats.EnergyShieldRechargeAppliesToLife === 'boolean' ? stats.EnergyShieldRechargeAppliesToLife : null,
+    rechargeAppliesToEnergyShield: typeof stats.EnergyShieldRechargeAppliesToEnergyShield === 'boolean' ? stats.EnergyShieldRechargeAppliesToEnergyShield : null,
+    configuration: poe2DefenseConfiguration(build), findings,
+  };
+}
+
+/** Read selections from the same exported XML as the stats, avoiding additional
+ * live calls. Explicit invalid selections never fall back to a different set.
+ * Local XML typing accounts for fields absent from the legacy shared types. */
+function poe2DefenseConfiguration(build: PoBBuild): string[] {
+  type Element = Record<string, any>;
+  const rows = (value: Element | Element[] | undefined): Element[] => value === undefined ? [] : Array.isArray(value) ? value : [value];
+  const select = (value: Element | Element[] | undefined, id: unknown, byIndex = false): Element | undefined => {
+    const sets = rows(value);
+    if (id === undefined) return sets.length === 1 ? sets[0] : undefined;
+    return byIndex ? sets[Number(id) - 1] : sets.find(set => String(set.id) === String(id));
+  };
+  const tree = build.Tree;
+  const items = build.Items as Element | undefined;
+  const skills = build.Skills as Element | undefined;
+  const config = build.Config as Element | undefined;
+  const spec = select(tree?.Spec, tree?.activeSpec, true);
+  const itemSet = select(items?.ItemSet, items?.activeItemSet);
+  const skillSet = select(skills?.SkillSet, skills?.activeSkillSet);
+  // Older XML stores Input directly under Config. Placeholders are not explicit inputs.
+  const configSet = config?.ConfigSet !== undefined
+    ? select(config.ConfigSet, config.activeConfigSet)
+    : config?.activeConfigSet === undefined ? config : undefined;
+  const label = (set: Element | undefined, id: unknown): string => set
+    ? `${set.title ?? 'untitled'} (selection ${id ?? set.id ?? 'single'})` : 'unknown';
+  const mainGroup = (build.Build as Element | undefined)?.mainSocketGroup;
+  const secondWeapons = itemSet?.useSecondWeaponSet ?? (items?.ItemSet === undefined ? items?.useSecondWeaponSet : undefined);
+  const weaponSet = secondWeapons === true || secondWeapons === 'true' ? '2'
+    : secondWeapons === false || secondWeapons === 'false' ? '1' : 'unknown';
+  const result = [
+    `Tree: ${label(spec, tree?.activeSpec)}`,
+    `Item set: ${label(itemSet, items?.activeItemSet)}`,
+    `Weapon set: ${weaponSet}`,
+    `Skill set: ${label(skillSet, skills?.activeSkillSet)}; main group: ${mainGroup ?? 'unknown'}`,
+    `Configuration: ${label(configSet, config?.activeConfigSet)}`,
+  ];
+  const inputs = rows(configSet?.Input).filter(input => typeof input.name === 'string' &&
+    /^(enemy|condition|buff|use|EHP|DisableEHP|customMods)/.test(input.name));
+  for (const input of inputs) {
+    const value = input.boolean ?? input.number ?? input.string;
+    if (typeof value === 'string' || typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) {
+      result.push(`${input.name}: ${value}`);
+    }
+  }
+  if (!inputs.length) result.push('Explicit enemy/recovery configuration inputs: unknown. Native defaults and unreported conditions are not inferred.');
+  return result;
+}
+
+export function formatPoe2DefensiveAnalysis(analysis: PoE2DefensiveAnalysis): string {
+  const number = (value: number | null, unit = '') => value === null ? 'unknown' : `${value}${unit}`;
+  const lines = [
+    '=== PoE2 Defensive Analysis ===',
+    'Overall viability: unknown. This report describes measured defenses under the selected configuration.',
+    '', '**Selected configuration**', ...analysis.configuration, '', '**Resistances**',
+    ...analysis.resistances.map(res => `${res.type}: ${number(res.value, '%')}; configured cap: ${number(res.cap, '%')}; missing: ${number(res.missing, '%')}; over-cap reserve: ${number(res.overCap, '%')}`),
+  ];
+  for (const section of poe2DefenseSections) {
+    lines.push('', `**${section.title}**`);
+    for (const [key, label, unit] of section.fields) lines.push(`${label}: ${number(analysis.stats[key], unit)}`);
+    lines.push(section.note);
+  }
+  lines.push(`Energy Shield recharge applies to Life: ${analysis.rechargeAppliesToLife ?? 'unknown'}`,
+    `Energy Shield recharge applies to Energy Shield: ${analysis.rechargeAppliesToEnergyShield ?? 'unknown'}`);
+  const lowest = analysis.lowestMaximumHit;
+  lines.push('', lowest
+    ? `Lowest measured maximum hit: ${lowest.types.join(', ')} (${lowest.value}); ${lowest.measuredTypes}/5 damage types measured. Unmeasured damage types remain unknown.`
+    : 'Lowest measured maximum hit: unknown; per-type outputs are unavailable.');
+  lines.push('', '**Findings and next checks**');
+  for (const issue of analysis.findings) {
+    lines.push(`[${issue.severity.toUpperCase()}] ${issue.title}: ${issue.description}`);
+    for (const suggestion of issue.suggestions) lines.push(`  - ${suggestion}`);
+  }
+  lines.push(lowest
+    ? `Start by inspecting the ${lowest.types.join('/')} maximum-hit breakdown. Compare candidate changes with the same selected build, enemy and recovery conditions; upgrade gains have not been measured.`
+    : 'Read native per-type maximum-hit and recovery breakdowns before prioritizing a defensive upgrade.');
+  lines.push('Missing outputs are unknown, not zero or proof of absent defenses. Charm, leech and recharge uptime require encounter-specific checks.');
+  return lines.join('\n') + '\n';
+}
+
 /**
  * Defensive Analyzer for Path of Building builds
  *

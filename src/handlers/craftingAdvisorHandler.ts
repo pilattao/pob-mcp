@@ -3,10 +3,14 @@ import type { PoeNinjaClient } from '../services/poeNinjaClient.js';
 import { fetchBaseModData } from '../services/craftingDataService.js';
 import { wrapHandler } from '../utils/errorHandling.js';
 import { resolveLeague } from '../services/leagueResolver.js';
+import type { BuildService } from '../services/buildService.js';
+import { suggestPoe2Crafting, type Poe2CraftingAdvisorArgs } from '../services/poe2CraftingAdvisor.js';
 
 export interface CraftingAdvisorContext {
   getLuaClient: () => AnyLuaClient | null;
   ninjaClient: PoeNinjaClient;
+  buildService?: BuildService;
+  ensureLuaClient?: () => Promise<void>;
 }
 
 export interface CraftingResponseInput {
@@ -87,16 +91,12 @@ export function buildCraftingResponse(input: CraftingResponseInput): string {
  */
 export async function handleSuggestCrafting(
   context: CraftingAdvisorContext,
-  args: {
-    slot: string;
-    base?: string;
-    desired_mods?: string[];
-    budget?: 'low' | 'medium' | 'high';
-    ilvl?: number;
-    league?: string;
-  }
+  args: Poe2CraftingAdvisorArgs
 ) {
   return wrapHandler('suggest crafting', async () => {
+    if (process.env.POE_GAME !== 'poe1') {
+      return { content: [{ type: 'text', text: await suggestPoe2Crafting(context, args) }] };
+    }
     const { slot, desired_mods = [] } = args;
     const league = resolveLeague(args.league);
 

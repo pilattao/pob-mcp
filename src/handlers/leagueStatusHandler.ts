@@ -28,6 +28,20 @@ export interface LeagueStatusContext {
 }
 
 export async function handleGetActiveLeagues(context: LeagueStatusContext) {
+  if ((process.env.POE_GAME ?? 'poe2') === 'poe2') {
+    if (!context.tradeClient) return {isError:true,content:[{type:'text',text:'PoE2 trade client is disabled.'}]};
+    try {
+      const data=await context.tradeClient.getLeagues();
+      const configured=process.env.POE_LEAGUE?.trim() || null;
+      return {content:[{type:'text',text:JSON.stringify({game:'poe2',
+        source:'https://www.pathofexile.com/api/trade2/data/leagues',
+        configuredLeague:configured,configuredLeagueIsListed:configured===null?null:data.result.some(l=>l.id===configured),
+        leagues:data.result,migrationTargets:'not supplied by this endpoint; no destinations inferred',
+        cache:'Metadata may be cached for up to one hour.',
+      },null,2)}]};
+    } catch(error) {return {isError:true,content:[{type:'text',text:`PoE2 league metadata unavailable: ${error instanceof Error?error.message:String(error)}`}]};}
+  }
+
   if (!context.tradeClient) {
     return {
       content: [

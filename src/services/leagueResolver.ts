@@ -47,6 +47,7 @@ export const PERMANENT_LEAGUES = new Set<string>([
 export function getDefaultLeague(): string {
   const env = process.env.POE_LEAGUE;
   if (env && env.trim().length > 0) return env.trim();
+  if ((process.env.POE_GAME ?? "poe2") === "poe2") throw new Error("Provide an explicit PoE2 league or POE_LEAGUE; no Standard fallback is selected");
   return "Standard";
 }
 
@@ -81,7 +82,7 @@ export function getParentLeague(league: string): string {
   if (PERMANENT_LEAGUES.has(league)) return league;
   const ruthless = /ruthless/i.test(league);
   const ssf = /\bssf\b/i.test(league);
-  const hardcore = /^hardcore\b/i.test(league) || /\bhardcore\b/i.test(league);
+  const hardcore = /^hardcore\b/i.test(league) || /\b(?:hardcore|hc)\b/i.test(league);
   if (ruthless) {
     if (hardcore && ssf) return "Hardcore SSF Ruthless";
     if (hardcore) return "Hardcore Ruthless";
@@ -112,7 +113,7 @@ export interface LeagueClassification {
 export function classifyLeague(league: string): LeagueClassification {
   const isPermanent = PERMANENT_LEAGUES.has(league);
   const ssf = /\bssf\b/i.test(league);
-  const hardcore = /\bhardcore\b/i.test(league);
+  const hardcore = /\b(?:hardcore|hc)\b/i.test(league);
   const ruthless = /\bruthless\b/i.test(league);
   return {
     name: league,

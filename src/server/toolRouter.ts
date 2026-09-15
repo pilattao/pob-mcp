@@ -852,14 +852,25 @@ export async function routeToolCall(
         args?.build_name as string | undefined
       );
 
-    case "create_budget_build":
-      if (!args) throw new Error("Missing arguments");
-      const budgetBuildContext = deps.contextBuilder.buildAdvancedOptimizationContext();
-      return await handleCreateBudgetBuild(
-        budgetBuildContext,
-        args.build_name as string,
-        (args.budget_tier || 'league-start') as string
-      );
+    case "create_budget_build": {
+      const options = args ?? {};
+      const budgetBuildContext = {
+        ...deps.contextBuilder.buildAdvancedOptimizationContext(),
+        tradeClient: deps.tradeClient ?? undefined,
+        statMapper: deps.statMapper ?? undefined,
+        ninjaClient: deps.ninjaClient,
+        skillGemService: skillGemContext.skillGemService,
+      };
+      return await handleCreateBudgetBuild(budgetBuildContext, options.build_name as string,
+        (options.budget_tier ?? 'league-start') as string, {
+          budget: options.budget as number | undefined, currency: options.currency as string | undefined,
+          league: options.league as string | undefined, slots: options.slots as string[] | undefined,
+          itemRequirements: options.item_requirements as any, runeTargets: options.rune_targets as any,
+          includeGems: options.include_gems as boolean | undefined, priority: options.priority as any,
+          maxPricePerItem: options.max_price as number | undefined, limitPerSlot: options.limit as number | undefined,
+          maxSearches: options.max_searches as number | undefined,
+        });
+    }
 
     // Phase 7: Build Validation
     case "validate_build":
@@ -927,7 +938,9 @@ export async function routeToolCall(
       return await handleCompareGemSetups(skillGemContext, {
         build_name: args.build_name as string,
         skill_index: args.skill_index as number | undefined,
-        setups: args.setups as Array<{ name: string; gems: string[] }>,
+        evaluation_skill_index: args.evaluation_skill_index as number | undefined,
+        metric: args.metric as Parameters<typeof handleCompareGemSetups>[1]['metric'],
+        setups: args.setups as Parameters<typeof handleCompareGemSetups>[1]['setups'],
       });
 
     case "validate_gem_quality":
@@ -993,6 +1006,9 @@ export async function routeToolCall(
         league: args.league as string | undefined,
         item_type: args.item_type as string | undefined,
         rarity: args.rarity as "unique" | "rare" | "magic" | "normal" | undefined,
+        variant: args.variant as string | undefined,
+        corrupted: args.corrupted as boolean | undefined,
+        stats: args.stats as Array<{id:string;min?:number;max?:number}> | undefined,
       });
     }
 
@@ -1030,7 +1046,16 @@ export async function routeToolCall(
     case "find_item_upgrades": {
       if (!args) throw new Error("Missing arguments");
       return await handleFindItemUpgradesNew(
-        { getLuaClient: deps.getLuaClient },
+        {
+          buildService: handlerContext.buildService,
+          getLuaClient: deps.getLuaClient,
+          ensureLuaClient: deps.ensureLuaClient,
+          tradeClient: deps.tradeClient ?? undefined,
+          statMapper: deps.statMapper ?? undefined,
+          ninjaClient: deps.ninjaClient,
+          recommendationEngine: deps.recommendationEngine ?? undefined,
+          skillGemService: skillGemContext.skillGemService,
+        },
         args as any
       );
     }
@@ -1087,21 +1112,21 @@ export async function routeToolCall(
     }
 
     case "generate_shopping_list": {
-      if (!deps.tradeClient) {
-        throw new Error("Trade API is not enabled. Set POE_TRADE_ENABLED=true to enable.");
-      }
-      if (!args) throw new Error("Missing arguments");
       const shoppingContext = {
-        buildService: deps.contextBuilder.buildHandlerContext().buildService,
-        tradeClient: deps.tradeClient,
+        buildService: handlerContext.buildService,
+        getLuaClient: deps.getLuaClient,
+        ensureLuaClient: deps.ensureLuaClient,
+        tradeClient: deps.tradeClient ?? undefined,
         statMapper: deps.statMapper || undefined,
-        ninjaClient: deps.ninjaClient
+        ninjaClient: deps.ninjaClient,
+        recommendationEngine: deps.recommendationEngine ?? undefined,
+        skillGemService: skillGemContext.skillGemService,
       };
       return await handleGenerateShoppingList(shoppingContext, {
-        build_name: args.build_name as string,
-        league: resolveLeague(args.league as string | undefined),
-        budget: args.budget as 'budget' | 'medium' | 'endgame' | undefined
-      });
+        ...args,
+        league: args?.league !== undefined || process.env.POE_LEAGUE
+          ? resolveLeague(args?.league as string | undefined) : '',
+      } as any);
     }
 
     // ========================================
@@ -1188,7 +1213,7 @@ export async function routeToolCall(
 
     case "plan_leveling":
       return await handlePlanLeveling(
-        { getLuaClient: deps.getLuaClient, ensureLuaClient: deps.ensureLuaClient },
+        { buildService: handlerContext.buildService, getLuaClient: deps.getLuaClient, ensureLuaClient: deps.ensureLuaClient },
         args || {}
       );
 
@@ -1215,6 +1240,8 @@ export async function routeToolCall(
 
     case "suggest_crafting": {
       const craftingContext = {
+        buildService: handlerContext.buildService,
+        ensureLuaClient: deps.ensureLuaClient,
         getLuaClient: deps.getLuaClient,
         ninjaClient: deps.ninjaClient,
       };

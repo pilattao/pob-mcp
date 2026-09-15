@@ -19,6 +19,52 @@ type SpectreSelection = { id: string; name: string; groupIndex?: number; gemInde
 // business methods; only the connection layer differs.
 // ─────────────────────────────────────────────────────────────────────────────
 
+export interface NativeGemSpec {
+  refIndex?: number;
+  replaceIndex?: number;
+  gemId?: string;
+  gemName?: string;
+  level?: number;
+  quality?: number;
+  count?: number;
+  enabled?: boolean;
+  enableGlobal1?: boolean;
+  enableGlobal2?: boolean;
+  statSet?: Record<string, number>;
+  statSetCalcs?: Record<string, number>;
+  skillPart?: number;
+  skillPartCalcs?: number;
+}
+export interface NativeGemEvaluationRequest {
+  expectedBuildName: string;
+  expectedXml: string;
+  skillSetId: string | number;
+  groupIndex: number;
+  evaluationGroupIndex?: number;
+  metric?: 'CombinedDPS' | 'TotalDPS' | 'FullDPS' | 'MinionCombinedDPS' | 'TotalEHP' | 'AverageDamage' | 'Speed';
+  setups?: Array<{name: string; gems: NativeGemSpec[]}>;
+  search?: {mode: 'suggest' | 'optimize'; targetGemCount?: number; candidateGemIds?: string[]; maxEvaluations?: number; limit?: number};
+}
+export interface NativeGemEvaluationRow {
+  name: string;
+  gems?: Array<NativeGemSpec & {index?: number; name: string; skillId?: string; support: boolean}>;
+  output?: Record<string, number>;
+  deltas?: Record<string, {absolute: number; percent?: number}>;
+  supports?: Array<{gemIndex?: number; gemId?: string; name: string; status: string; description?: string; targets?: Array<{name: string; skillId: string}>}>;
+  warnings?: string[];
+  valid: boolean;
+  error?: string;
+}
+export interface NativeGemEvaluation {
+  baseline: Record<string, number>;
+  metric: string;
+  setups: NativeGemEvaluationRow[];
+  ranking: NativeGemEvaluationRow[];
+  conditions: Record<string, unknown>;
+  search: {evaluations: number; eligibleCandidates: number; budget: number; truncated: boolean; algorithm: string; scope?: string};
+  rollback: {xmlUnchanged: boolean; statsUnchanged: boolean; selectionsUnchanged: boolean; undoUnchanged: boolean};
+}
+
 abstract class PoBApiBase {
   protected buffer = "";
   protected isSending = false;
@@ -80,7 +126,7 @@ abstract class PoBApiBase {
     });
   }
 
-  protected async send(obj: LuaRequest): Promise<LuaResponse> {
+  protected async send(obj: LuaRequest, timeoutMs?: number): Promise<LuaResponse> {
     if (!this.isAlive()) throw new Error("PoB bridge not connected or not ready");
     if (this.killed)     throw new Error("PoB bridge disconnected");
     if (this.isSending)  throw new Error("Concurrent request not supported");
@@ -92,7 +138,7 @@ abstract class PoBApiBase {
       let attempts = 0;
       const maxAttempts = 100;
       while (attempts < maxAttempts) {
-        const line = await this.readLineWithTimeout();
+        const line = await this.readLineWithTimeout(timeoutMs);
         attempts++;
         if (!line.trim() || !line.trim().startsWith("{")) continue;
         try { return JSON.parse(line); } catch {}
@@ -206,6 +252,13 @@ abstract class PoBApiBase {
     const res = await this.send({ action: "get_gem_detail", params });
     if (!res.ok) throw new Error(res.error || "get_gem_detail failed");
     return res.gem;
+  }
+
+  /** Native transactional comparison: rejects a different/stale loaded build. */
+  async evaluateGemSetups(params: NativeGemEvaluationRequest): Promise<NativeGemEvaluation> {
+    const res = await this.send({action: 'evaluate_gem_setups', params: {...params}}, Math.max(this.getTimeoutMs(), 60000));
+    if (!res.ok) throw new Error(res.error || 'evaluate_gem_setups failed');
+    return res.result as NativeGemEvaluation;
   }
 
   async setLevel(level: number): Promise<void> {

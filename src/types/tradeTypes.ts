@@ -9,6 +9,7 @@ export interface StatFilter {
   value?: {
     min?: number;
     max?: number;
+    weight?: number;
   };
   disabled?: boolean;
 }
@@ -24,11 +25,13 @@ export interface StatFilterGroup {
 }
 
 export interface TradeFilters {
+  equipment_filters?: {filters?: Record<string,{min?:number;max?:number;option?:string|number|boolean|null}>;disabled?:boolean};
   trade_filters?: {
     filters?: {
       price?: {
         min?: number;
         max?: number;
+        option?: string;
       };
       indexed?: {
         option?: string; // e.g., "1day", "3days", "1week"
@@ -160,6 +163,7 @@ export interface TradeFilters {
 }
 
 export interface TradeQuery {
+  engine?: string;
   query: {
     status?: {
       option: 'available' | 'online' | 'onlineleague' | 'securable' | 'any';
@@ -172,6 +176,7 @@ export interface TradeQuery {
   };
   sort?: {
     price?: 'asc' | 'desc';
+    [statGroup: `statgroup.${number}`]: 'asc' | 'desc' | undefined;
   };
 }
 
@@ -181,7 +186,7 @@ export interface TradeQuery {
 
 export interface SearchResult {
   id: string; // Search ID for fetching results
-  complexity: number;
+  complexity?: number;
   result: string[]; // Array of item IDs
   total: number;
   inexact?: boolean;
@@ -379,8 +384,12 @@ export interface LeagueData {
 
 export interface ItemRequirements {
   slot: string;
+  itemCategory?: string;
   minLife?: number;
   minES?: number;
+  minWard?: number;
+  minSpirit?: number;
+  minRuneSockets?: number;
   fireResist?: number;
   coldResist?: number;
   lightningResist?: number;

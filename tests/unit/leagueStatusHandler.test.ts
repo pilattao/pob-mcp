@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from '@jest/globals';
+import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import { handleGetActiveLeagues } from '../../src/handlers/leagueStatusHandler';
 
 function getText(result: { content: Array<{ type: string; text: string }> }): string {
@@ -15,8 +15,12 @@ function makeFakeClient(leagueIds: string[]) {
 
 describe('handleGetActiveLeagues', () => {
   const originalEnv = process.env.POE_LEAGUE;
+  const originalGame = process.env.POE_GAME;
+  beforeEach(() => { process.env.POE_GAME = 'poe1'; });
 
   afterEach(() => {
+    if (originalGame === undefined) delete process.env.POE_GAME;
+    else process.env.POE_GAME = originalGame;
     if (originalEnv === undefined) delete process.env.POE_LEAGUE;
     else process.env.POE_LEAGUE = originalEnv;
   });
@@ -73,5 +77,31 @@ describe('handleGetActiveLeagues', () => {
     const text = getText(r);
     expect(text).toMatch(/network down/);
     expect(text).toMatch(/Mirage/);
+  });
+});
+
+describe('PoE2 league identity', () => {
+  const originalGame = process.env.POE_GAME;
+  const originalLeague = process.env.POE_LEAGUE;
+  beforeEach(() => { process.env.POE_GAME = 'poe2'; });
+  afterEach(() => {
+    if (originalGame === undefined) delete process.env.POE_GAME; else process.env.POE_GAME = originalGame;
+    if (originalLeague === undefined) delete process.env.POE_LEAGUE; else process.env.POE_LEAGUE = originalLeague;
+  });
+  it('lists concurrent leagues without selecting a default or inventing migration targets', async () => {
+    delete process.env.POE_LEAGUE;
+    const r = await handleGetActiveLeagues({tradeClient: makeFakeClient(['Forbidden Rites', 'Runes of Aldur', 'HC Forbidden Rites'])});
+    const data = JSON.parse(getText(r));
+    expect(data.configuredLeague).toBeNull();
+    expect(data.configuredLeagueIsListed).toBeNull();
+    expect(data.leagues.map((l: any) => l.id)).toEqual(['Forbidden Rites', 'Runes of Aldur', 'HC Forbidden Rites']);
+    expect(data.migrationTargets).toContain('no destinations inferred');
+  });
+  it('reports an unlisted requested league instead of silently substituting another league', async () => {
+    process.env.POE_LEAGUE = 'Missing league';
+    const r = await handleGetActiveLeagues({tradeClient: makeFakeClient(['Forbidden Rites'])});
+    const data = JSON.parse(getText(r));
+    expect(data.configuredLeague).toBe('Missing league');
+    expect(data.configuredLeagueIsListed).toBe(false);
   });
 });
