@@ -1,3 +1,4 @@
+import { readPoe2BuildEvidence } from "../services/poe2BuildEvidence.js";
 import type { BuildService } from "../services/buildService.js";
 import type { ValidationService } from "../services/validationService.js";
 import type { AnyLuaClient } from "../pobLuaBridge.js";
@@ -22,6 +23,11 @@ export async function handleValidateBuild(
   args?: { build_name?: string }
 ) {
   return wrapHandler('validate build', async () => {
+  if (process.env.POE_GAME === 'poe2') {
+    const evidence = await readPoe2BuildEvidence(context, args?.build_name);
+    const validation = context.validationService.validateBuild(evidence.build, null, evidence.stats);
+    return { content: [{type:'text' as const, text:evidence.note + '\n\n' + context.validationService.formatValidation(validation)}] };
+  }
   const { buildService, validationService, getLuaClient, ensureLuaClient } = context;
 
   let buildData;

@@ -1,6 +1,8 @@
-import { describe, it, expect } from '@jest/globals';
-import { existsSync } from 'fs';
-import { resolve } from 'path';
+import { useLegacyCraftFixture } from '../fixtures/coreCraftLegacy';
+let legacy: ReturnType<typeof useLegacyCraftFixture>;
+beforeAll(() => { legacy = useLegacyCraftFixture(); });
+afterAll(() => legacy.cleanup());
+import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 
 import {
   ensureLoaded,
@@ -17,18 +19,11 @@ import {
   searchMods,
 } from '../../src/services/pobModDataLoader';
 
-const pobDir = process.env.POB_DIRECTORY ?? resolve(process.cwd(), '..', 'PathOfBuilding');
-const hasModData = (existsSync(resolve(pobDir, 'src', 'Data', 'ModExplicit.lua')) || existsSync(resolve(pobDir, 'src', 'Data', 'ModItem.lua')));
 
-const describeIfPob = hasModData ? describe : describe.skip;
-
-describeIfPob('pobModDataLoader', () => {
-  it('parses the PoB explicit-mod table and exposes thousands of entries', () => {
+describe('pobModDataLoader', () => {
+  it('parses every entry in the coherent PoE1 fixture', () => {
     ensureLoaded();
-    // PoB split ModItem.lua (explicits + implicits, >5k entries) into per-category
-    // files; we read ModExplicit.lua, so the count is now the ~4.3k EXPLICIT mods —
-    // which is what crafting queries need. Guards against a truncated/failed parse.
-    expect(getModCount()).toBeGreaterThan(4000);
+    expect(getModCount()).toBe(18);
   });
 
   it('returns null for an unknown mod ID', () => {
@@ -61,7 +56,7 @@ describeIfPob('pobModDataLoader', () => {
 
   it('groups mods by their group field', () => {
     const lifeGroup = getModGroup('IncreasedLife');
-    expect(lifeGroup.length).toBeGreaterThan(10);
+    expect(lifeGroup.map(m => m.id)).toEqual(['IncreasedLife1', 'IncreasedLife6', 'IncreasedLife11', 'IncreasedLife12', 'GreedEssence7']);
     expect(lifeGroup.every((m) => m.group === 'IncreasedLife')).toBe(true);
   });
 
@@ -135,7 +130,7 @@ describeIfPob('pobModDataLoader', () => {
 
     it('filters by mod group', () => {
       const hits = searchMods({ group: 'IncreasedLife', limit: 200 });
-      expect(hits.length).toBeGreaterThan(10);
+      expect(hits).toHaveLength(5);
       expect(hits.every((m) => m.group === 'IncreasedLife')).toBe(true);
     });
 
@@ -151,7 +146,7 @@ describeIfPob('pobModDataLoader', () => {
     });
 
     it('limit=0 disables the cap (results may be large)', () => {
-      const capped = searchMods({ group: 'IncreasedLife', limit: 5 });
+      const capped = searchMods({ group: 'IncreasedLife', limit: 2 });
       const all = searchMods({ group: 'IncreasedLife', limit: 0 });
       expect(all.length).toBeGreaterThan(capped.length);
     });

@@ -46,6 +46,9 @@ function isTcpUnavailableError(err: unknown): boolean {
  * complete answer.
  */
 function renderBaseFallback(nodeId: string, reason: string) {
+  if (process.env.POE_GAME === 'poe2') {
+    return {isError:true,content:[{type:'text',text:`Native PoE2 node state is unavailable: ${reason}. No current tree version or transformation state was established.`}]};
+  }
   const baseNode = getPobNode(nodeId);
   if (!baseNode) {
     return {
@@ -97,14 +100,6 @@ interface NodeStateResult {
   conqueredBy?: { seed?: number; conqueror_type?: string };
   ascendancyName?: string;
 }
-
-const CONQUEROR_TO_JEWEL: Record<string, string> = {
-  karui: "Lethal Pride",
-  vaal: "Glorious Vanity",
-  templar: "Militant Faith",
-  maraketh: "Brutal Restraint",
-  eternal: "Elegant Hubris",
-};
 
 export async function handleGetTreeNodeWithTimelessJewels(
   context: TransformedNodeHandlerContext,
@@ -164,14 +159,8 @@ export async function handleGetTreeNodeWithTimelessJewels(
   lines.push(`Allocated: ${node.allocated ? "yes" : "no"}`);
 
   if (node.conqueredBy) {
-    const jewelType =
-      (node.conqueredBy.conqueror_type &&
-        CONQUEROR_TO_JEWEL[node.conqueredBy.conqueror_type.toLowerCase()]) ||
-      "Timeless Jewel";
-    lines.push(
-      `Transformed by: ${jewelType}` +
-        (node.conqueredBy.seed ? ` (seed ${node.conqueredBy.seed})` : "")
-    );
+    lines.push(`Conquest metadata: ${node.conqueredBy.conqueror_type ?? 'type unknown'}` +
+      (node.conqueredBy.seed !== undefined ? ` (seed ${node.conqueredBy.seed})` : ''));
   }
 
   lines.push("");
@@ -185,15 +174,13 @@ export async function handleGetTreeNodeWithTimelessJewels(
   if (!node.conqueredBy) {
     lines.push("");
     lines.push(
-      "Note: this node is NOT being transformed by a Timeless Jewel — the stats above " +
-        "match the base data. For a jewel-transformed view, call this tool on a node " +
-        "inside a Timeless Jewel's radius (see `find_jewel_affected_nodes`)."
+      "Transformation status is unknown: no conquest metadata was returned. " +
+        "The displayed native stats may include item effects; absence of metadata does not establish base-data equality."
     );
   } else {
     lines.push("");
     lines.push(
-      "These stats already include the Timeless Jewel transformation — no tooltip " +
-        "paste needed. Source: PoB's PassiveSpec, post-transformation."
+      "Source: the current native PassiveSpec descriptions. Conquest metadata alone does not establish complete seed-dependent transformation support."
     );
   }
 

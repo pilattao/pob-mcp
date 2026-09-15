@@ -1,5 +1,5 @@
 import type { AnyLuaClient } from "../pobLuaBridge.js";
-import { handleGetBuildIssues } from "./buildGoalsHandlers.js";
+import { handleGetBuildIssues, formatQuickStats } from "./buildGoalsHandlers.js";
 import fs from "fs/promises";
 import path from "path";
 import { wrapHandler } from "../utils/errorHandling.js";
@@ -21,20 +21,7 @@ export async function handleLuaStart(context: LuaHandlerContext) {
       content: [
         {
           type: "text" as const,
-          text: [
-        'PoB Lua Bridge started successfully.',
-        '',
-        'The PoB calculation engine is now ready to load builds and compute stats.',
-        '',
-        '⚠️  IMPORTANT — PoB Update button: Because the TCP API patches Main.lua, PoB\'s',
-        'integrity check will flag the file as modified and may show an update prompt.',
-        'Do NOT click "Update" while Claude is working — it will replace Main.lua and',
-        'break the MCP connection for the rest of this session.',
-        '',
-        'If you want to run a PoB update, close PoB and launch it normally (without',
-        'LaunchPoBWithAPI.bat). After updating, relaunch via LaunchPoBWithAPI.bat and',
-        'the patch will be re-applied automatically.',
-      ].join('\n'),
+          text: 'PoB Lua Bridge started successfully. Connection ready.',
         },
       ],
     };
@@ -77,9 +64,13 @@ export async function handleLuaNewBuild(context: LuaHandlerContext, className?: 
       throw new Error('Lua client not initialized');
     }
 
-    await luaClient.newBuild(className || ascendancy ? { className, ascendancy } : undefined);
-
-    const classDesc = className ? ` (${className}${ascendancy ? `/${ascendancy}` : ''})` : '';
+    const created = await luaClient.newBuild(className || ascendancy ? { className, ascendancy } : undefined);
+    if (process.env.POE_GAME === 'poe2' && (!created?.ready || !created.info)) {
+      throw new Error('Native PoB2 build creation was not confirmed');
+    }
+    const actualClass = created?.info?.className ?? className;
+    const actualAscendancy = created?.info?.ascendClassName ?? ascendancy;
+    const classDesc = actualClass ? ` (${actualClass}${actualAscendancy ? `/${actualAscendancy}` : ''})` : '';
     return {
       content: [
         {
@@ -165,6 +156,7 @@ export async function handleLuaLoadBuild(
   name?: string
 ) {
   return wrapHandler('load build', async () => {
+    if ((buildName !== undefined) === (buildXml !== undefined)) throw new Error('Provide exactly one of build_name or build_xml');
     await context.ensureLuaClient();
 
     const luaClient = context.getLuaClient();
@@ -231,32 +223,22 @@ export async function handleLuaLoadBuild(
         summaryLines.push(`**${info.name || name}** | Level ${info.level} ${info.className ?? ''}${info.ascendClassName ? ` (${info.ascendClassName})` : ''}`);
       }
 
-      const s = await luaClient.getStats(['Life', 'TotalDPS', 'CombinedDPS', 'MinionTotalDPS',
-        'FireResist', 'ColdResist', 'LightningResist', 'ChaosResist', 'TotalEHP']).catch(() => null);
-      if (s) {
-        const dps = Number(s.CombinedDPS || s.TotalDPS || s.MinionTotalDPS || 0);
-        const dpsLabel = (s.MinionTotalDPS && !s.TotalDPS) ? 'Minion DPS' : 'DPS';
-        summaryLines.push(`Life: ${Number(s.Life ?? 0).toLocaleString()} | ${dpsLabel}: ${Math.round(dps).toLocaleString()} | EHP: ${Number(s.TotalEHP ?? 0).toLocaleString()}`);
-        summaryLines.push(`Resists: F${s.FireResist}% C${s.ColdResist}% L${s.LightningResist}% Ch${s.ChaosResist}%`);
+      const { issues, stats } = await handleGetBuildIssues({ getLuaClient: context.getLuaClient, ensureLuaClient: async () => {} });
+      summaryLines.push(...formatQuickStats(stats));
+      const topIssues = issues.filter(i => i.severity === 'error' || i.severity === 'warning').slice(0, 3);
+      if (topIssues.length > 0) {
+        summaryLines.push('', '**Top Issues:**');
+        for (const issue of topIssues) summaryLines.push(`  ${issue.severity === 'error' ? '🔴' : '🟡'} ${issue.message}`);
+      } else {
+        summaryLines.push('No critical or warning issues established from available outputs.');
       }
-
-      const issuesResult = await handleGetBuildIssues({ getLuaClient: context.getLuaClient, ensureLuaClient: async () => {} }).catch(() => null);
-      if (issuesResult) {
-        const { issues } = issuesResult;
-        const topIssues = issues.filter((i: any) => i.severity === 'error' || i.severity === 'warning').slice(0, 3);
-        if (topIssues.length > 0) {
-          summaryLines.push('');
-          summaryLines.push('**Top Issues:**');
-          for (const issue of topIssues) {
-            const icon = issue.severity === 'error' ? '🔴' : '🟡';
-            summaryLines.push(`  ${icon} ${issue.message}`);
-          }
-        } else {
-          summaryLines.push('');
-          summaryLines.push('✅ No critical issues detected.');
-        }
+      for (const issue of issues.filter(i => i.message.startsWith('Scan scope:') || i.message.startsWith('Unknown data:'))) {
+        summaryLines.push(issue.message);
       }
-    } catch { /* auto-context is best-effort */ }
+    } catch (error) {
+      summaryLines.push(...formatQuickStats({}));
+      summaryLines.push(`Issue scan unavailable; build status is unknown: ${error instanceof Error ? error.message : 'read failed'}`);
+    }
     const summary = summaryLines.join('\n');
 
     const loadText = `✅ Build "${name || 'MCP Build'}" loaded.${extra}` + (summary ? '\n---\n' + summary : '');
@@ -422,10 +404,35 @@ export async function handleLuaGetTree(context: LuaHandlerContext, includeNodeId
     if (tree && typeof tree === 'object') {
       textLines.push(`Tree Version: ${tree.treeVersion ?? 'Unknown'}`);
       const classId = tree.classId != null ? tree.classId : undefined;
-      const className = classId != null ? CLASS_NAMES[classId] : undefined;
-      textLines.push(`Class: ${className ?? 'Unknown'} (ID: ${classId ?? 'Unknown'})`);
       const ascId = tree.ascendClassId != null ? tree.ascendClassId : undefined;
-      const ascName = classId != null && ascId != null && ascId > 0 ? ASCENDANCY_NAMES[classId]?.[ascId] : (ascId === 0 ? 'None' : undefined);
+      const game = (process.env.POE_GAME ?? 'poe2').trim().toLowerCase();
+      if (game !== 'poe1' && game !== 'poe2') throw new Error('POE_GAME must be poe2 or poe1');
+      const poe2 = game === 'poe2' || String(tree.treeVersion ?? '').startsWith('0_');
+      let className: string | undefined;
+      let ascName: string | undefined;
+      if (poe2) {
+        // Class IDs are game-specific. Read the current native spec's names;
+        // the PoE1 numeric maps cannot identify a PoE2 class or ascendancy.
+        let info: any;
+        try { info = await luaClient.getBuildInfo(); } catch { /* Unknown identity is shown below. */ }
+        const matches = info && (info.game == null || info.game === 'poe2') &&
+          (!tree.treeVersion || String(tree.treeVersion).startsWith('0_')) &&
+          (!info.treeVersion || (String(info.treeVersion).startsWith('0_') &&
+            (!tree.treeVersion || info.treeVersion === tree.treeVersion)));
+        const nativeName = (value: unknown) => typeof value === 'string' && value.trim() ? value.trim() : undefined;
+        if (matches) {
+          className = nativeName(info.className);
+          ascName = nativeName(info.ascendClassName);
+        }
+        if (ascId === 0 || ascId === '0') ascName = 'None';
+        textLines.push(className || (ascName && ascName !== 'None')
+          ? 'Source: native PoB2 build info; unavailable names remain unknown.'
+          : 'Native PoB2 identity unavailable or mismatched; class and ascendancy names are unknown.');
+      } else {
+        className = classId != null ? CLASS_NAMES[classId] : undefined;
+        ascName = classId != null && ascId != null && ascId > 0 ? ASCENDANCY_NAMES[classId]?.[ascId] : (ascId === 0 ? 'None' : undefined);
+      }
+      textLines.push(`Class: ${className ?? 'Unknown'} (ID: ${classId ?? 'Unknown'})`);
       textLines.push(`Ascendancy: ${ascName ?? 'Unknown'} (ID: ${ascId ?? 'Unknown'})`);
 
       if (tree.secondaryAscendClassId) {
@@ -574,7 +581,9 @@ export async function handleGetGemDetail(context: LuaHandlerContext, gemName: st
     if (typeof gem.castTime === 'number' && gem.castTime > 0) {
       lines.push(`**Cast Time:** ${gem.castTime.toFixed(2)} sec`);
     }
-    if (typeof gem.maxLevel === 'number') lines.push(`**Max Level:** ${gem.maxLevel}`);
+    const levelCap = (value: unknown) => typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : 'unknown';
+    lines.push(`**Natural gem level cap:** ${levelCap(gem.naturalMaxLevel)}`);
+    lines.push(`**Calculation data level cap:** ${levelCap(gem.maxLevel)}`);
     if (Array.isArray(gem.variants) && gem.variants.length > 1) {
       lines.push(`**Variants:** ${gem.variants.join(', ')}`);
     }

@@ -1,11 +1,10 @@
 /**
  * Threshold-Jewel evaluator.
  *
- * Threshold jewels (Brawn, Lethal Assault, Inertia, Healthy Mind, Conqueror's
- * Efficiency, etc.) have effects gated on the surrounding tree state — most
- * commonly "With at least N <attribute> in Radius, …". They don't change
- * passive tooltips; instead, the conditional bonus turns on or off based on
- * the allocated nodes within the jewel's radius.
+ * Legacy PoE1 "With at least N <attribute> in Radius" thresholds count
+ * eligible nodes whether allocated or not. This is distinct from allocated-
+ * attribute scaling effects. PoB2 retains legacy parser patterns, but its
+ * installed item catalog does not establish these as available PoE2 jewels.
  *
  * This service:
  *   - Parses threshold-style mod patterns from a jewel's mod text.
@@ -18,13 +17,13 @@
  *
  * Phase-1 scope:
  *   - Attribute thresholds: Strength, Dexterity, Intelligence.
- *   - Assumes "Basic Jewel Socket" radius (800 units) by default; can be
- *     overridden per call when the socket type differs.
+ *   - Uses an explicit radius or item Radius line; direct legacy calls keep
+ *     the old Small fallback for compatibility, not as a claim about the item.
  *   - Does NOT yet parse "Notable Passive Skills in Radius" patterns or
  *     "Total Attributes in Radius" — those are rarer and Phase-2 material.
  */
 
-import { JEWEL_RADII, sumAttributeInRadius } from "./radiusUtils.js";
+import { JEWEL_RADII, getJewelRadius, sumAttributeInRadius, radiusTree, type RadiusContext } from "./radiusUtils.js";
 
 export type Attribute = "Strength" | "Dexterity" | "Intelligence";
 
@@ -77,6 +76,8 @@ export interface ThresholdEvaluation {
   margin: number;
   /** Radius used for the evaluation (in tree-coord units). */
   radius: number;
+  /** Text-only legacy calculation, before other jewels/transforms/overrides. */
+  basis?: string;
 }
 
 /**
@@ -84,22 +85,28 @@ export interface ThresholdEvaluation {
  *
  * @param threshold        Parsed threshold mod.
  * @param socketNodeId     Node ID of the jewel socket containing the jewel.
- * @param allocatedNodes   The build's allocated node IDs.
+ * @param allocatedNodes   Retained for API compatibility; these thresholds include unallocated nodes.
  * @param radius           Override radius in tree units. Defaults to "Small"
- *                         (800) which is the radius of inner-tree basic jewel
- *                         sockets where threshold jewels typically live.
+ *                         (800) for legacy API compatibility. Item-specific
+ *                         callers should provide the actual radius.
  */
 export function evaluateThreshold(
   threshold: ThresholdMod,
   socketNodeId: string,
   allocatedNodes: Set<string>,
-  radius: number = JEWEL_RADII.small
+  radius: number = JEWEL_RADII.small,
+  context: RadiusContext = {}
 ): ThresholdEvaluation {
+  const resolved = radiusTree(context);
+  if (resolved.treeVersion.startsWith('0_')) {
+    throw new Error('PoE2 attribute-threshold evaluation is unavailable: legacy parser patterns are not proof of an available PoE2 threshold jewel or its effective attributes.');
+  }
   const inRadius = sumAttributeInRadius(
     socketNodeId,
     radius,
     threshold.attribute,
-    allocatedNodes
+    undefined,
+    resolved
   );
   return {
     threshold,
@@ -107,6 +114,7 @@ export function evaluateThreshold(
     triggered: inRadius >= threshold.requiredAmount,
     margin: inRadius - threshold.requiredAmount,
     radius,
+    basis: 'All eligible nodes in radius, including unallocated nodes; printed base attributes only. Native transforms and overrides are not evaluated.',
   };
 }
 
@@ -116,6 +124,7 @@ export interface JewelThresholdSocketInfo {
   mods: string[];
   /** Optional radius override (in tree units). If omitted, JEWEL_RADII.small is used. */
   radius?: number;
+  treeVersion?: string;
 }
 
 export interface EvaluateBuildResult {
@@ -132,7 +141,8 @@ export interface EvaluateBuildResult {
 
 export function evaluateBuildThresholds(
   jewels: JewelThresholdSocketInfo[],
-  allocatedNodes: Set<string>
+  allocatedNodes: Set<string>,
+  context: RadiusContext = {}
 ): EvaluateBuildResult {
   const out: EvaluateBuildResult = {
     jewelsScanned: jewels.length,
@@ -143,9 +153,11 @@ export function evaluateBuildThresholds(
     const thresholds = parseThresholdMods(j.mods);
     if (thresholds.length === 0) continue;
     out.jewelsWithThresholds++;
-    const radius = j.radius ?? JEWEL_RADII.small;
+    const resolved = radiusTree({ ...context, treeVersion: j.treeVersion ?? context.treeVersion });
+    const label = j.mods.find(line => /^Radius:/i.test(line))?.replace(/^Radius:\s*/i, '').trim();
+    const radius = j.radius ?? getJewelRadius(label ?? 'Small', resolved).outer;
     const evals = thresholds.map((t) =>
-      evaluateThreshold(t, j.socketNodeId, allocatedNodes, radius)
+      evaluateThreshold(t, j.socketNodeId, allocatedNodes, radius, resolved)
     );
     out.evaluations.push({
       socketNodeId: j.socketNodeId,

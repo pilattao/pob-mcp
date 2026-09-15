@@ -1,4 +1,10 @@
-import { describe, it, expect } from "@jest/globals";
+import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals";
+import * as loader from '../../src/services/pobTreeDataLoader.js';
+import { legacyJewelTree } from '../fixtures/jewelRadiusFixture.js';
+
+let savedGame: string | undefined;
+beforeEach(() => { savedGame = process.env.POE_GAME; process.env.POE_GAME = 'poe1'; jest.spyOn(loader, 'getPobTreeData').mockReturnValue(legacyJewelTree()); });
+afterEach(() => { jest.restoreAllMocks(); if (savedGame === undefined) delete process.env.POE_GAME; else process.env.POE_GAME = savedGame; });
 import {
   isRadiusEffectMod,
   categorizeRadiusMod,
@@ -96,7 +102,7 @@ describe("categorizeRadiusMod", () => {
   });
 });
 
-describe("findRadiusEffectJewels (uses real PoB tree)", () => {
+describe("findRadiusEffectJewels (deterministic PoE1 fixture)", () => {
   it("returns empty result when no jewels have qualifying mods", () => {
     const jewels = [
       {
@@ -129,10 +135,7 @@ describe("findRadiusEffectJewels (uses real PoB tree)", () => {
   });
 
   it("identifies Energy-From-Within-style transform mods", () => {
-    // Use a Large (1500) radius override so we don't depend on the exact
-    // 800-unit geometry of socket 26196 in PoB's tree. The point of the test
-    // is the categorization + reporting flow, not the radius math (covered
-    // separately in radiusUtils).
+    // The fixture puts the Life node exactly 1000 units from this socket.
     const jewels = [
       {
         socketNodeId: "26196",
@@ -143,8 +146,6 @@ describe("findRadiusEffectJewels (uses real PoB tree)", () => {
         radius: 1500,
       },
     ];
-    // Node 6712 (Life) is in Lethal Pride's 1500-unit radius from socket 26196,
-    // verified empirically in the timelessJewelService tests.
     const allocated = new Set<string>(["6712"]);
     const r = findRadiusEffectJewels(jewels, allocated);
     expect(r.jewelsWithRadiusEffects).toBe(1);
@@ -157,7 +158,7 @@ describe("findRadiusEffectJewels (uses real PoB tree)", () => {
     const jewels = [
       {
         socketNodeId: "26196",
-        jewelName: "Brawn",
+        jewelName: "Synthetic attribute-threshold jewel",
         mods: [
           "With at least 40 Strength in Radius, 1% increased Strength per 10 Strength on Allocated Passives in Radius",
         ],

@@ -1,34 +1,12 @@
 /**
- * Radius-Effect-Unique Jewel Service.
- *
- * Detects "in Radius" mods on socketed jewels that are NOT handled by the
- * dedicated tools (Timeless transformations, attribute thresholds). Surfaces
- * the mod text alongside the allocated nodes in the jewel's radius so the
- * caller can reason about impact.
- *
- * Examples this catches:
- *   - "Increases and Reductions to Life in Radius are Transformed to apply
- *     to Energy Shield" (Energy From Within)
- *   - "Increases and Reductions to Intelligence in Radius are Transformed
- *     to apply to Mana" (Healthy Mind)
- *   - "Notable Passive Skills in Radius grant nothing" / "50% increased Effect
- *     of non-Keystone Passive Skills in Radius" (Might of the Meek)
- *   - "Notable Passives in Radius are conquered by..." — caught here, but
- *     timelessJewelService handles the actual transformation
- *
- * Excluded (handled by other tools):
- *   - Timeless Jewels (Lethal Pride / Glorious Vanity / Militant Faith /
- *     Brutal Restraint / Elegant Hubris) — see timelessJewelService.
- *   - Attribute thresholds ("With at least N <Strength/Dex/Int> in Radius, …")
- *     — see thresholdJewelService.
- *
- * Phase-1 scope: detection + reporting. Does not yet compute the numeric
- * impact (that requires per-unique semantics — Energy From Within transforms
- * Life→ES, Healthy Mind transforms Life→Mana via Strength conversion, etc.).
- * The reported info is enough for a human or Claude to interpret.
+ * Detect non-Timeless radius effects and report their geometric scope.
+ * PoE2 supports native Time-Lost small/notable targets and Controlled
+ * Metamorphosis rings. Other transformations remain explicitly unmodeled.
+ * Legacy PoE1 effects remain text/geometry reports, not numeric simulations.
  */
 
-import { JEWEL_RADII, nodesInRadius } from "./radiusUtils.js";
+import { getJewelRadius, nodesInRadius, radiusTree, type RadiusContext, type RadiusBand } from "./radiusUtils.js";
+import type { PobNode } from './pobTreeDataLoader.js';
 
 const RADIUS_PATTERN = /\bin\s+(?:the\s+)?radius\b/i;
 
@@ -38,6 +16,8 @@ const TIMELESS_INDICATORS: RegExp[] = [
   /conquered by the eternal/i,
   /conquered by the templars/i,
   /conquered by the maraketh/i,
+  /conquered by the kalguur/i,
+  /conquered by the abyssals/i,
   /commanded leadership over \d+ warriors under/i,
   /denoted service of \d+ dekhara/i,
   /carved to glorify \d+ new faithful/i,
@@ -92,7 +72,13 @@ export interface JewelRadiusEffectInfo {
   radiusMods: Array<{ line: string; category: RadiusCategory }>;
   /** Radius used for the node-in-radius lookup (in tree-coord units). */
   radius: number;
-  /** Allocated node IDs in radius — those that the radius mods would affect. */
+  innerRadius?: number;
+  treeVersion?: string;
+  /** Geometric scope only for effects whose target rules are not implemented. */
+  candidatesInRadius?: string[];
+  eligibleUnallocated?: string[];
+  notes?: string[];
+  /** Allocated targets for supported rules; see notes for unmodeled effects. */
   affectedAllocated: string[];
 }
 
@@ -100,8 +86,42 @@ export interface JewelSocketInfo {
   socketNodeId: string;
   jewelName: string;
   mods: string[];
-  /** Radius override; defaults to small (800) for inner-tree basic sockets. */
+  /** Explicit outer radius in tree-coordinate units; otherwise read native item radius. */
   radius?: number;
+  innerRadius?: number;
+  treeVersion?: string;
+}
+
+function jewelRadius(jewel: JewelSocketInfo, context: Required<RadiusContext>): RadiusBand {
+  if (jewel.radius !== undefined) return { inner: jewel.innerRadius ?? 0, outer: jewel.radius };
+  const lines = jewel.mods.map(stripModSourcePrefix);
+  const rings = lines.flatMap(line => /^(?:Only )?affects Passives in (.+) Ring$/i.exec(line)?.[1]?.toLowerCase() ?? []);
+  const radiusLabel = lines.find(l => /^Radius:/i.test(l))?.replace(/^Radius:\s*/i, '').trim();
+  if (context.treeVersion.startsWith('0_')) {
+    if (rings.length || radiusLabel?.toLowerCase() === 'variable') {
+      // ModParser.lua maps these ring variants to native radius indices 5..12.
+      const labels = ['very small', 'small', 'medium-small', 'medium', 'medium-large', 'large', 'very large', 'massive'];
+      const variants = [...new Set(rings)];
+      if (variants.length !== 1 || !labels.includes(variants[0])) throw new Error('PoE2 ring radius is unknown: provide one selected ring variant.');
+      return getJewelRadius(labels.indexOf(variants[0]) + 5, context);
+    }
+    const upgrades = lines.flatMap(l => /^Upgrades Radius to (.+)$/i.exec(l)?.[1] ?? []);
+    if (new Set(upgrades.map(s => s.toLowerCase())).size > 1) throw new Error('PoE2 radius upgrade is ambiguous.');
+    const label = upgrades[0] ?? radiusLabel ?? (/Time-Lost (Ruby|Emerald|Sapphire|Diamond)/i.test(jewel.jewelName) ? 'Small' : undefined);
+    if (!label) throw new Error('PoE2 jewel radius is unknown: provide the native Radius line or explicit bounds.');
+    return getJewelRadius(label, context);
+  }
+  return getJewelRadius(radiusLabel ?? 'Small', context);
+}
+
+function targetsNode(line: string, node: PobNode): boolean | null {
+  if (/Passives in Radius can be Allocated without being connected to your tree/i.test(line)) {
+    return !node.classesStart && !node.isJewelSocket && !node.ascendancyName;
+  }
+  // PoB2 ModParser explicitly excludes attribute travel nodes from "Small".
+  if (/^(?:\d+% increased Effect of Small Passive Skills in Radius$|Small Passive Skills in Radius also grant |Allocated Small Passive Skills in Radius grant nothing$)/i.test(line)) return !node.isNotable && !node.isKeystone && !node.isJewelSocket && !node.classesStart && !node.isAscendancyStart && !node.isAttribute;
+  if (/^(?:\d+% increased Effect of Notable Passive Skills in Radius$|Notable Passive Skills in Radius (?:also grant |grant nothing$|are Transformed to instead grant:))/i.test(line)) return !!node.isNotable;
+  return null;
 }
 
 export interface FindRadiusEffectsResult {
@@ -116,7 +136,8 @@ export interface FindRadiusEffectsResult {
  */
 export function findRadiusEffectJewels(
   jewels: JewelSocketInfo[],
-  allocatedNodes: Set<string>
+  allocatedNodes: Set<string>,
+  context: RadiusContext = {}
 ): FindRadiusEffectsResult {
   const out: FindRadiusEffectsResult = {
     jewelsScanned: jewels.length,
@@ -130,9 +151,21 @@ export function findRadiusEffectJewels(
     if (matchedMods.length === 0) continue;
     out.jewelsWithRadiusEffects++;
 
-    const radius = j.radius ?? JEWEL_RADII.small;
-    const inRadius = nodesInRadius(j.socketNodeId, radius);
-    const affectedAllocated = inRadius.filter((id) => allocatedNodes.has(id));
+    const resolved = radiusTree({ ...context, treeVersion: j.treeVersion ?? context.treeVersion });
+    const poe2 = resolved.treeVersion.startsWith('0_');
+    const band = jewelRadius(j, resolved);
+    const inRadius = nodesInRadius(j.socketNodeId, band, undefined, resolved);
+    const notes: string[] = [];
+    const active = !poe2 || allocatedNodes.has(j.socketNodeId);
+    if (!active) notes.push('The jewel socket is not allocated; its radius effects are inactive.');
+    const affectedAllocated = inRadius.filter(id => active && allocatedNodes.has(id) &&
+      (!poe2 || matchedMods.some(line => targetsNode(line, resolved.tree.nodes[id]) === true)));
+    if (poe2 && matchedMods.some(line => targetsNode(line, {} as PobNode) === null)) {
+      throw new Error(`PoE2 radius effect evaluation unavailable for ${j.jewelName}: unimplemented target/transform rules require native evaluation; no empty affected-node result is inferred.`);
+    }
+    const allowsDisconnected = matchedMods.some(line => /can be Allocated without being connected/i.test(line));
+    const eligibleUnallocated = poe2 && active && allowsDisconnected ? inRadius.filter(id => !allocatedNodes.has(id) &&
+      matchedMods.some(line => /can be Allocated without being connected/i.test(line) && targetsNode(line, resolved.tree.nodes[id]))) : [];
 
     out.jewels.push({
       socketNodeId: j.socketNodeId,
@@ -141,7 +174,12 @@ export function findRadiusEffectJewels(
         line,
         category: categorizeRadiusMod(line),
       })),
-      radius,
+      radius: band.outer,
+      innerRadius: band.inner,
+      treeVersion: resolved.treeVersion,
+      candidatesInRadius: inRadius,
+      eligibleUnallocated,
+      notes,
       affectedAllocated,
     });
   }

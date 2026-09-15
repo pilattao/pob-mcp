@@ -1,8 +1,7 @@
 import type { AnyLuaClient } from "../pobLuaBridge.js";
-import fs from 'fs/promises';
-import path from 'path';
 import { wrapHandler } from "../utils/errorHandling.js";
-import { sanitizeBuildName } from "../utils/pathSanitizer.js";
+import { ConfigService, validateConfigPatch, writeConfigPreset, readConfigPreset, listConfigPresets,
+  type ConfigInput, type ConfigGame, type NativeConfigSnapshot } from "../services/configService.js";
 
 export interface ConfigHandlerContext {
   getLuaClient: () => AnyLuaClient | null;
@@ -15,77 +14,90 @@ export interface ConfigPresetContext {
   pobDirectory: string;
 }
 
-const PRESET_DIR_NAME = '.pob-mcp-presets';
+const configGame = (): ConfigGame => process.env.POE_GAME === 'poe2' ? 'poe2' : 'poe1';
+const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 
-async function getPresetPath(pobDirectory: string, name: string): Promise<string> {
-  const dir = path.join(pobDirectory, PRESET_DIR_NAME);
-  await fs.mkdir(dir, { recursive: true });
-  return sanitizeBuildName(`${name}.json`, dir);
+async function nativeClient(context: ConfigHandlerContext): Promise<AnyLuaClient> {
+  await context.ensureLuaClient();
+  const client = context.getLuaClient();
+  if (!client) throw new Error('Lua bridge not active. Use lua_start and lua_load_build first.');
+  return client;
 }
 
 export async function handleSaveConfigPreset(context: ConfigPresetContext, name: string) {
-  return wrapHandler('save config preset', async () => {
-  await context.ensureLuaClient();
-  const luaClient = context.getLuaClient();
-  if (!luaClient) throw new Error('Lua bridge not active. Use lua_load_build first.');
-
-  const config = await luaClient.getConfig();
-  const filePath = await getPresetPath(context.pobDirectory, name);
-  await fs.writeFile(filePath, JSON.stringify(config, null, 2), 'utf-8');
-
-  return {
-    content: [{
-      type: 'text' as const,
-      text: `✅ Config preset "${name}" saved with ${Object.keys(config).length} settings.\nPath: ${filePath}`,
-    }],
-  };
+  return wrapHandler('save config preset',async()=>{
+    const client=await nativeClient(context);
+    const game=configGame();
+    let input: ConfigInput;
+    let source: {kind:string;activeConfigSetId?:number};
+    if (game === 'poe2') {
+      const captured=await new ConfigService(client).explicitOverrides();
+      input=captured.input;source={kind:'native PoB2 ConfigSet XML Input overrides',activeConfigSetId:captured.snapshot.activeConfigSetId};
+    } else {
+      input=validateConfigPatch(await client.getConfig(),'poe1',true);
+      source={kind:'native PoE1 config input'};
+    }
+    const file=await writeConfigPreset(context.pobDirectory,name,{schemaVersion:1,game,scope:game==='poe2'?'explicit-input-overrides':'native-input',source,input});
+    return {content:[{type:'text' as const,text:`Config preset "${name}" saved for ${game}: ${Object.keys(input).length} ${game==='poe2'?'explicit input overrides':'settings'}.\nPath: ${file}`} ]};
   });
 }
 
 export async function handleLoadConfigPreset(context: ConfigPresetContext, name: string) {
-  return wrapHandler('load config preset', async () => {
-  await context.ensureLuaClient();
-  const luaClient = context.getLuaClient();
-  if (!luaClient) throw new Error('Lua bridge not active. Use lua_load_build first.');
-
-  const filePath = await getPresetPath(context.pobDirectory, name);
-  let config: Record<string, any>;
-  try {
-    const raw = await fs.readFile(filePath, 'utf-8');
-    config = JSON.parse(raw);
-  } catch {
-    throw new Error(`Preset "${name}" not found. Use save_config_preset to create it first.`);
-  }
-
-  await luaClient.setConfig(config);
-
-  return {
-    content: [{
-      type: 'text' as const,
-      text: `✅ Config preset "${name}" loaded (${Object.keys(config).length} settings applied).`,
-    }],
-  };
+  return wrapHandler('load config preset',async()=>{
+    const game=configGame();
+    const preset=await readConfigPreset(context.pobDirectory,name,game);
+    const client=await nativeClient(context);
+    const count=Object.keys(preset.input).length;
+    let detail='';
+    if (count && game==='poe2') {
+      const result=await new ConfigService(client).apply(preset.input);
+      detail=` Applied and verified in native config set ${result.after.activeConfigSetId}.`;
+    } else if (count) await client.setConfig(preset.input);
+    return {content:[{type:'text' as const,text:`Config preset "${name}" (${game}): ${count} input overrides in this patch.${detail} Unlisted inputs remain unchanged.`}]};
   });
 }
 
 export async function handleListConfigPresets(context: ConfigPresetContext) {
-  return wrapHandler('list config presets', async () => {
-  const dir = path.join(context.pobDirectory, PRESET_DIR_NAME);
-  let files: string[] = [];
-  try {
-    files = await fs.readdir(dir);
-  } catch { /* dir doesn't exist yet */ }
-  const presets = files.filter(f => f.endsWith('.json')).map(f => f.replace('.json', ''));
-
-  return {
-    content: [{
-      type: 'text' as const,
-      text: presets.length > 0
-        ? `Available config presets:\n${presets.map((p, i) => `${i + 1}. ${p}`).join('\n')}`
-        : 'No config presets saved yet. Use save_config_preset to create one.',
-    }],
-  };
+  return wrapHandler('list config presets',async()=>{
+    const game=configGame();
+    const presets=await listConfigPresets(context.pobDirectory,game);
+    return {content:[{type:'text' as const,text:presets.length
+      ? `Config presets for ${game}:\n${presets.map((p,i)=>`${i+1}. ${p.name}${p.legacy?' (legacy PoE1)':''}`).join('\n')}`
+      : `No config presets saved for ${game}.`}]};
   });
+}
+
+function formatNativeConfig(config: NativeConfigSnapshot): string {
+  return `=== Native PoE2 Configuration ===\n\nSource: ${config.source}\nActive config set: ${config.activeConfigSetId}\n` +
+    `Effective enemy level: ${config.effectiveEnemyLevel ?? 'unavailable'}\n` +
+    `Enemy level override: ${config.input.enemyLevel === undefined ? 'not set (automatic)' : config.input.enemyLevel}\n\n` +
+    `Raw native inputs (include initialized defaults; flags do not establish applicability to the build):\n` + JSON.stringify(config.input,null,2);
+}
+
+export type SetConfigArgs = {config_name?: string; value?: boolean | number | string; config?: Record<string, unknown>};
+function explicitConfigPatch(args: SetConfigArgs): ConfigInput {
+  if (args.config !== undefined) {
+    if (args.config_name !== undefined || args.value !== undefined) throw new Error('Provide either config batch or config_name/value, not both');
+    return validateConfigPatch(args.config);
+  }
+  if (typeof args.config_name !== 'string' || !args.config_name.trim() || args.value === undefined) throw new Error('config_name and value, or a config batch, are required');
+  return validateConfigPatch({[args.config_name]:args.value});
+}
+
+async function optionalStats(client: AnyLuaClient): Promise<{stats?: Record<string,unknown>;error?:string}> {
+  try {
+    const stats=await client.getStats(['CombinedDPS','TotalDPS','Life','EnergyShield']);
+    if (!stats || typeof stats !== 'object') throw new Error('native stats unavailable');
+    return {stats};
+  } catch(error) {return {error:errorText(error)};}
+}
+
+function nativeWriteSummary(before: NativeConfigSnapshot, after: NativeConfigSnapshot, patch: ConfigInput): string {
+  const value=(v: unknown)=>v===undefined?'not set':JSON.stringify(v);
+  const lines=[`Configuration applied and verified in native PoB2 config set ${after.activeConfigSetId}.`];
+  for(const key of Object.keys(patch)) lines.push(`${key}:\n  Old Value: ${value(before.input[key])}\n  Requested: ${value(patch[key])}\n  Stored: ${value(after.input[key])}`);
+  lines.push(`Effective enemy level: ${before.effectiveEnemyLevel ?? 'unavailable'} → ${after.effectiveEnemyLevel ?? 'unavailable'}`);
+  return lines.join('\n');
 }
 
 /**
@@ -99,8 +111,9 @@ export async function handleGetConfig(context: ConfigHandlerContext) {
     throw new Error("Lua bridge not active. Use lua_start and lua_load_build first.");
   }
 
-  const config = await luaClient.getConfig();
-  const formatted = formatConfigOutput(config);
+  const formatted = configGame() === 'poe2'
+    ? formatNativeConfig(await new ConfigService(luaClient).read())
+    : formatConfigOutput(await luaClient.getConfig());
 
   return {
     content: [
@@ -118,9 +131,24 @@ export async function handleGetConfig(context: ConfigHandlerContext) {
  */
 export async function handleSetConfig(
   context: ConfigHandlerContext,
-  args: { config_name: string; value: boolean | number | string }
+  args: SetConfigArgs
 ) {
   return wrapHandler('set config', async () => {
+  if (configGame() === 'poe2') {
+    const patch=explicitConfigPatch(args);
+    const client=await nativeClient(context);
+    const result=await new ConfigService(client).apply(patch);
+    let text=nativeWriteSummary(result.before,result.after,result.patch);
+    const metrics=await optionalStats(client);
+    if(metrics.error) text+=`\nStats unavailable: ${metrics.error}`;
+    else if(metrics.stats) {
+      for(const key of ['CombinedDPS','TotalDPS','Life','EnergyShield']) {
+        const value=metrics.stats[key];if(typeof value==='number' && Number.isFinite(value))text+=`\n${key}: ${value}`;
+      }
+    }
+    return {content:[{type:'text' as const,text}]};
+  }
+  if (typeof args.config_name !== 'string' || args.value === undefined || args.config !== undefined) throw new Error('PoE1 requires config_name and value');
   await context.ensureLuaClient();
   const luaClient = context.getLuaClient();
   if (!luaClient) {
@@ -214,6 +242,30 @@ export async function handleSetEnemyStats(
   }
 ) {
   return wrapHandler('set enemy stats', async () => {
+  if (configGame() === 'poe2') {
+    // Verified against ConfigOptions: these are the native count/countAllowZero keys.
+    const names: Record<string,string>={level:'enemyLevel',fire_resist:'enemyFireResist',cold_resist:'enemyColdResist',
+      lightning_resist:'enemyLightningResist',chaos_resist:'enemyChaosResist',armor:'enemyArmour',evasion:'enemyEvasion'};
+    const patch:ConfigInput={};
+    for(const [key,value] of Object.entries(args)) {
+      if(!names[key])throw new Error(`Unknown enemy parameter: ${key}`);
+      if(value===undefined)continue;
+      if(typeof value!=='number' || !Number.isInteger(value) || value<0)throw new Error(`${key} must be a nonnegative integer`);
+      patch[names[key]]=value;
+    }
+    validateConfigPatch(patch);
+    const client=await nativeClient(context);
+    const previous=await optionalStats(client);
+    const result=await new ConfigService(client).apply(patch);
+    const current=await optionalStats(client);
+    let text=nativeWriteSummary(result.before,result.after,result.patch);
+    const metric=['CombinedDPS','TotalDPS'].find(key=>typeof previous.stats?.[key]==='number' && Number.isFinite(previous.stats[key]) && typeof current.stats?.[key]==='number' && Number.isFinite(current.stats[key]));
+    if(metric)text+=`\n${metric}: ${previous.stats![metric]} → ${current.stats![metric]}`;
+    else text+='\nDPS comparison unavailable.';
+    if(previous.error)text+=`\nPrevious stats unavailable: ${previous.error}`;
+    if(current.error)text+=`\nCurrent stats unavailable: ${current.error}`;
+    return {content:[{type:'text' as const,text}]};
+  }
   await context.ensureLuaClient();
   const luaClient = context.getLuaClient();
   if (!luaClient) {

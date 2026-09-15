@@ -26,6 +26,8 @@ import zlib from "node:zlib";
 
 /** Options accepted by `handleImportCharacter`, mirroring the PoB GUI defaults. */
 export interface ImportCharacterOptions {
+  /** Entire PoB2 public export, taken from get_character_pob.pob_xml. */
+  pobXml?: string;
   clearJewels?: boolean;
   clearItems?: boolean;
   clearSkills?: boolean;
@@ -426,6 +428,22 @@ export async function handleImportCharacter(
   options?: ImportCharacterOptions
 ) {
   return wrapHandler("import character", async () => {
+    if (process.env.POE_GAME === 'poe2') {
+      if (typeof options?.pobXml !== 'string' || !options.pobXml.trim()) {
+        throw new Error('PoE2 public import: call get_character_pob and pass its pob_xml field; PoE1 character-window endpoints are not a PoE2 source');
+      }
+      if (accountName !== undefined || realm !== undefined ||
+          Object.entries(options).some(([key,value]) => key !== 'pobXml' && value !== undefined)) {
+        throw new Error('A complete PoB2 XML snapshot replaces the whole build; account lookup and selective import options do not apply');
+      }
+      await context.ensureLuaClient();
+      const client = context.getLuaClient();
+      if (!client) throw new Error('Lua client not initialized');
+      const title = characterName?.trim() || 'Public PoE2 Snapshot';
+      await client.loadBuildXml(options.pobXml, title);
+      return {content:[{type:'text' as const,text:`✅ Public PoE2 snapshot loaded as "${title}". Complete XML preserved, including its item, skill, tree and configuration sets.`}]};
+    }
+    if (options?.pobXml !== undefined) throw new Error('pob_xml import requires PoE2 mode');
     const accountTrimmed = resolveAccountName(accountName);
     if (!characterName || !characterName.trim()) {
       throw new Error("character_name is required");

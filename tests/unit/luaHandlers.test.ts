@@ -40,11 +40,12 @@ describe('handleLuaStart', () => {
     expect(result.content[0].text).toContain('started successfully');
   });
 
-  it('includes the update-button warning in the response', async () => {
+  it('reports connection readiness without obsolete updater instructions', async () => {
     const ctx = makeContext();
     const result = await handleLuaStart(ctx);
-    expect(result.content[0].text).toContain('Update');
-    expect(result.content[0].text).toContain('LaunchPoBWithAPI');
+    const text = result.content[0].text;
+    expect(text).toContain('Connection ready');
+    expect(text).not.toMatch(/Claude|do\s+not\s+click|Update|Main\.lua|LaunchPoBWithAPI/i);
   });
 });
 

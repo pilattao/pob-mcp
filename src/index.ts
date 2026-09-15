@@ -345,6 +345,7 @@ class PoBMCPServer {
           console.error(`[Tool Stack] ${error.stack}`);
         }
         return {
+          isError: true,
           content: [
             {
               type: "text",

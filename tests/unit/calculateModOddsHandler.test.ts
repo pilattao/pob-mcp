@@ -1,20 +1,16 @@
-import { describe, it, expect } from '@jest/globals';
-import { existsSync } from 'fs';
-import { resolve } from 'path';
+import { useLegacyCraftFixture } from '../fixtures/coreCraftLegacy';
+let legacy: ReturnType<typeof useLegacyCraftFixture>;
+beforeAll(() => { legacy = useLegacyCraftFixture(); });
+afterAll(() => legacy.cleanup());
+import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 import { handleCalculateModOdds } from '../../src/handlers/calculateModOddsHandler';
 
-const pobDir = process.env.POB_DIRECTORY ?? resolve(process.cwd(), '..', 'PathOfBuilding');
-const hasData =
-  (existsSync(resolve(pobDir, 'src', 'Data', 'ModExplicit.lua')) || existsSync(resolve(pobDir, 'src', 'Data', 'ModItem.lua'))) &&
-  existsSync(resolve(pobDir, 'src', 'Data', 'Bases', 'body.lua')) &&
-  existsSync(resolve(pobDir, 'src', 'Data', 'Essence.lua'));
-const describeIfPob = hasData ? describe : describe.skip;
 
 function getText(r: { content: Array<{ type: string; text: string }> }): string {
   return r.content.map((c) => c.text).join('\n');
 }
 
-describeIfPob('handleCalculateModOdds', () => {
+describe('handleCalculateModOdds', () => {
   it('validates required args', async () => {
     expect((await handleCalculateModOdds({ base_name: '', ilvl: 86, targets: [] })).isError).toBe(true);
     expect((await handleCalculateModOdds({ base_name: 'Astral Plate', ilvl: 86, targets: [] })).isError).toBe(true);
@@ -73,6 +69,7 @@ describeIfPob('handleCalculateModOdds', () => {
     });
     const j = JSON.parse(getText(r));
     expect(j.warnings.join(' ')).toMatch(/same mod group/);
+    expect(j.combined_probability).toBe(0);
   });
 
   it('alt method caps slots at 1/1', async () => {

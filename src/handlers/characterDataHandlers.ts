@@ -34,6 +34,8 @@ interface StatRule {
 // Order matters: more specific patterns must precede generic ones
 // ("spell block" before "block", "mana (unreserved)" before "mana").
 const STAT_RULES: StatRule[] = [
+  { pattern: /spirit.*unreserved|unreserved.*spirit/i, field: "SpiritUnreserved" },
+  { pattern: /\bspirit\b/i, field: "Spirit" },
   { pattern: /fire\s*res/i, field: "FireResist", overcapField: "FireResistOverCap" },
   { pattern: /cold\s*res/i, field: "ColdResist", overcapField: "ColdResistOverCap" },
   { pattern: /light(ning)?\s*res/i, field: "LightningResist", overcapField: "LightningResistOverCap" },
@@ -204,8 +206,9 @@ export async function handleComputeConstraintMargins(
     const readStat = (rule: StatRule): number | undefined => {
       let v = stats[rule.field];
       if ((v == null || v === "") && rule.fallbackField) v = stats[rule.fallbackField];
+      if (typeof v !== "number" && typeof v !== "string") return undefined;
       const n = Number(v);
-      return v == null || v === "" || Number.isNaN(n) ? undefined : n;
+      return String(v).trim() === "" || !Number.isFinite(n) ? undefined : n;
     };
 
     const rows: MarginRow[] = [];
@@ -213,7 +216,11 @@ export async function handleComputeConstraintMargins(
       const { stat, tier, threshold, notes, rule, parsedThreshold } = rm;
       const i = rm.lineIdx;
       const cells = rm.cells;
-      const currentVal = rule ? readStat(rule) : undefined;
+      const nativeValue = rule ? readStat(rule) : undefined;
+      // CalcSections displays CritMultiplier as xN. A percent threshold instead
+      // expresses the same total multiplier as N*100%; this is not crit bonus.
+      const currentVal = nativeValue === undefined ? undefined
+        : nativeValue * (rule?.field === 'CritMultiplier' && parsedThreshold?.pct ? 100 : 1);
 
       let current = "—";
       let margin = "—";
@@ -280,7 +287,7 @@ export async function handleComputeConstraintMargins(
     if (violated.length > 0) {
       textLines.push(`🔴 ${violated.length} constraint(s) VIOLATED: ${violated.map((r) => r.stat).join(", ")} — compensation required before any change that spends these margins.`);
     } else {
-      textLines.push("✅ No violated constraints.");
+      textLines.push(manual.length ? "Constraints are not fully verified; no violation was found among evaluated rows." : "✅ No violated constraints.");
     }
     if (manual.length > 0) {
       textLines.push(`✍️ ${manual.length} row(s) need manual evaluation (non-numeric threshold or unmapped stat): ${manual.map((r) => r.stat).join(", ")}.`);

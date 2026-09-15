@@ -20,6 +20,12 @@
 import {
   ensureLoaded,
   matchStatLine,
+  getModGroup,
+  getModItemPath,
+  normalizeStatLine,
+  parseRolledValues,
+  rolledValuesFitTemplate,
+  resolveWeightForTags,
   type MatchResult,
   type PobMod,
 } from "../services/pobModDataLoader.js";
@@ -30,12 +36,12 @@ import {
   type PobBase,
 } from "../services/pobBaseDataLoader.js";
 import {
-  ensureCraftDataLoaded,
   matchMasterCraft,
   type MasterCraft,
 } from "../services/pobCraftDataLoader.js";
 import type { AnyLuaClient } from "../pobLuaBridge.js";
 import { parseItemRawMods, parseItemLevel } from "../utils/itemRawParser.js";
+import { resolvePobDataLocation } from "../services/pobDataPath.js";
 
 export interface AnalyzeItemModsContext {
   getLuaClient: () => AnyLuaClient | null;
@@ -70,6 +76,24 @@ interface LineAnalysis {
   masterMatch?: MasterCraft | null;
   /** True if this line is the second line of a hybrid mod above it. */
   isHybridContinuation?: boolean;
+  coverageGap?: string;
+}
+
+/** Keep PoB's permissive template matcher for legacy callers, but do not turn
+ * out-of-range, wrong-base or too-high-ilvl guesses into native identifications. */
+function nativeMatch(text: string, itemTags?: string[], ilvl?: number): MatchResult {
+  const result = matchStatLine(text, { itemTags, ilvl });
+  const candidates = result.candidates.filter(mod => mod.affix && ["Prefix", "Suffix"].includes(mod.type) &&
+    mod.level <= (ilvl ?? Infinity) && (!itemTags || resolveWeightForTags(mod, itemTags) > 0) &&
+    rolledValuesFitTemplate(parseRolledValues(text), mod.statLines[0]));
+  const best = candidates.includes(result.best!) ? result.best : candidates.sort((a,b) => b.level-a.level)[0] ?? null;
+  if (!best) return { query: text, candidates: [], best: null, meaningfulCandidateCount: 0 };
+  const ladder = itemTags ? getModGroup(best.group).filter(mod => mod.affix && mod.type === best.type &&
+    resolveWeightForTags(mod, itemTags) > 0 && mod.statLines.map(normalizeStatLine).join("\n") === best.statLines.map(normalizeStatLine).join("\n"))
+    .sort((a,b) => b.level-a.level) : [];
+  const index = ladder.findIndex(mod => mod.id === best.id);
+  return { query: text, candidates, best, meaningfulCandidateCount: candidates.length,
+    ...(index >= 0 ? { tier: index+1, tierMax: ladder.length, ...(index > 0 ? { nextTier: ladder[index-1] } : {}) } : {}) };
 }
 
 function cleanLine(line: string): { text: string; source: LineAnalysis["source"] } {
@@ -109,10 +133,17 @@ export async function handleAnalyzeItemMods(
   args: AnalyzeItemModsArgs,
   context?: AnalyzeItemModsContext
 ) {
+  if (!args.item_slot && (!Array.isArray(args.mod_lines) || args.mod_lines.length === 0)) {
+    return { content: [{ type: "text", text: "Error: provide mod_lines or item_slot." }], isError: true };
+  }
+  if (args.ilvl !== undefined && (!Number.isSafeInteger(args.ilvl) || args.ilvl < 1 || args.ilvl > 100)) {
+    return { content: [{ type: "text", text: "Error: ilvl must be an integer from 1 to 100." }], isError: true };
+  }
+  let game: "poe1" | "poe2";
   try {
+    game = resolvePobDataLocation().game;
     ensureLoaded();
     ensureBasesLoaded();
-    ensureCraftDataLoaded();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return {
@@ -186,7 +217,7 @@ export async function handleAnalyzeItemMods(
     liveItemNote = `Read "${item.name}" from slot "${item.slot}" (${item.baseName ?? item.type ?? "?"})`;
   }
 
-  if (!Array.isArray(modLines) || modLines.length === 0) {
+  if (!Array.isArray(modLines) || modLines.length === 0 || modLines.some(line => typeof line !== "string")) {
     return {
       content: [
         {
@@ -213,6 +244,9 @@ export async function handleAnalyzeItemMods(
   }
   const itemTags = base?.tags;
   const ilvl = resolvedIlvl;
+  if (game === "poe2" && base && ["jewel", "flask", "fishing", "incursionlimb", "tincture"].includes(base.sourceFile)) {
+    return { content: [{ type: "text", text: `PoE2 coverage gap: ${base.type} uses a separate modifier pool; ordinary ModItem matching is not applicable.` }], isError: true };
+  }
 
   // Per-line analysis pass
   const analyses: LineAnalysis[] = modLines.map((raw, i) => {
@@ -222,14 +256,21 @@ export async function handleAnalyzeItemMods(
     }
     // Natural and fractured both come from the prefix/suffix pool.
     if (source === "natural" || source === "fractured") {
-      const m = matchStatLine(text, { itemTags, ilvl });
+      const m = game === "poe2" ? nativeMatch(text, itemTags, ilvl) : matchStatLine(text, { itemTags, ilvl });
       return { inputLine: i + 1, raw, cleaned: text, source, match: m };
     }
     // Crafted lines come from the bench (ModMaster.lua). Match against it
     // using the base's item TYPE (e.g. "Body Armour"), not the tag chain.
     if (source === "crafted") {
-      const mc = matchMasterCraft(text, base?.type);
-      return { inputLine: i + 1, raw, cleaned: text, source, match: null, masterMatch: mc };
+      if (game === "poe2") return { inputLine: i+1, raw, cleaned: text, source, match: null,
+        coverageGap: "PoE2 crafted annotations do not establish a PoE1 bench craft; no equivalent bench source is validated." };
+      try {
+        const mc = matchMasterCraft(text, base?.type);
+        return { inputLine: i + 1, raw, cleaned: text, source, match: null, masterMatch: mc };
+      } catch (error) {
+        return { inputLine: i+1, raw, cleaned: text, source, match: null,
+          coverageGap: `Bench source unavailable: ${error instanceof Error ? error.message : String(error)}` };
+      }
     }
     // Enchanted (lab) mods aren't indexed here.
     return { inputLine: i + 1, raw, cleaned: text, source, match: null };
@@ -239,16 +280,30 @@ export async function handleAnalyzeItemMods(
   // mod ID, mark N+1 as a hybrid continuation. Multi-line mods (e.g.
   // life+armour, life+es) appear as two adjacent stat lines on the item
   // and would otherwise be reported twice.
-  for (let i = 1; i < analyses.length; i++) {
-    const a = analyses[i];
-    const prev = analyses[i - 1];
-    if (a.match?.best && prev.match?.best && a.match.best.id === prev.match.best.id) {
-      a.isHybridContinuation = true;
+  for (let i = 0; i < analyses.length; i++) {
+    const first = analyses[i];
+    const templates = first.match?.best?.statLines ?? [];
+    if (templates.length < 2 || i + templates.length > analyses.length) continue;
+    const continuation = templates.slice(1).every((template,j) => {
+      const next = analyses[i+j+1];
+      return next.source === first.source && normalizeStatLine(next.cleaned) === normalizeStatLine(template) &&
+        rolledValuesFitTemplate(parseRolledValues(next.cleaned), template);
+    });
+    if (!continuation) continue;
+    for (let j = 1; j < templates.length; j++) {
+      analyses[i+j].match = first.match;
+      analyses[i+j].isHybridContinuation = true;
     }
+    i += templates.length-1;
   }
 
   if (args.raw_json) {
     const json = {
+      game,
+      source: getModItemPath(),
+      weight_semantics: game === "poe2" ? "eligibility-only" : "spawn-weight",
+      tier_basis: "Highest minimum item level first within the compatible native mod group; T1 is not re-ranked at the supplied ilvl.",
+      ...(game === "poe2" ? { affix_budget: { complete: false, reason: "Text lines may be partial or hybrid; they do not establish open affix slots." } } : {}),
       base: base
         ? { name: base.name, type: base.type, tags: base.tags, implicit: base.implicit }
         : null,
@@ -260,6 +315,7 @@ export async function handleAnalyzeItemMods(
         cleaned: a.cleaned,
         source: a.source,
         is_hybrid_continuation: a.isHybridContinuation ?? false,
+        coverage_gap: a.coverageGap ?? null,
         match: a.match
           ? {
               best: a.match.best
@@ -303,6 +359,8 @@ export async function handleAnalyzeItemMods(
   // Human-readable output
   const lines: string[] = [];
   lines.push("=== Item Mod Analysis ===");
+  lines.push(`Game: ${game} | source: ${getModItemPath()}`);
+  if (game === "poe2") lines.push("PoB2 weights express eligibility only, not probabilities. Tier order is source minimum-level order.");
   if (liveItemNote) lines.push(liveItemNote);
   if (base) {
     lines.push(`Base: ${base.name} (${base.type}${base.subType ? `, ${base.subType}` : ""})`);
@@ -314,7 +372,7 @@ export async function handleAnalyzeItemMods(
     }
   } else {
     lines.push(`No base supplied — matching without tag gating (accuracy reduced).`);
-    lines.push(`Pass base_name (e.g. 'Astral Plate') or item_slot for precise tier ladders.`);
+    lines.push(`Pass base_name or item_slot for a class-specific tier ladder.`);
   }
   if (ilvl !== undefined) lines.push(`ilvl: ${ilvl}`);
   lines.push("");
@@ -338,6 +396,7 @@ export async function handleAnalyzeItemMods(
     if (a.source !== "natural") out.push(`    Source: ${a.source}`);
     // Bench-crafted line: report the master craft if we matched one.
     if (a.source === "crafted") {
+      if (a.coverageGap) { out.push(`    Coverage gap: ${a.coverageGap}`); return out; }
       if (a.masterMatch) {
         const mc = a.masterMatch;
         out.push(`    -> bench craft "${mc.affix}" [${mc.type}] L${mc.level} group=${mc.group} → ${mc.statLines.join(" / ")}`);
@@ -358,8 +417,10 @@ export async function handleAnalyzeItemMods(
     if (a.match.nextTier) {
       const nt = a.match.nextTier;
       out.push(`    Next tier: ${nt.id} "${nt.affix}" L${nt.level} → ${nt.statLines.join(" / ")}`);
-    } else if (a.match.best) {
+    } else if (a.match.tier === 1) {
       out.push(`    Next tier: (already top tier${itemTags ? " on this base" : ""})`);
+    } else {
+      out.push("    Next tier: (not established for this source/base)");
     }
     if (a.match.meaningfulCandidateCount > 1) {
       out.push(`    Ambiguous: ${a.match.meaningfulCandidateCount} naturally-rollable mods fit this value; best chosen by tier + weight. Supply base_name/ilvl to narrow.`);
@@ -392,7 +453,7 @@ export async function handleAnalyzeItemMods(
   // lines, concluded "two open prefixes", and recommended an Exalt slam on an item
   // the game correctly reports as FULL. State the budget explicitly so open-affix
   // counts are read from here, not inferred.
-  {
+  if (game === "poe1") {
     const enchantedOther = other.filter((a) => a.source === "enchanted").length;
     const occupyingOther = other.length - enchantedOther;
     const explicitCount = prefixes.length + suffixes.length + occupyingOther;
@@ -412,7 +473,7 @@ export async function handleAnalyzeItemMods(
     if (explicitCount >= 6) {
       lines.push(`  Item has ${explicitCount} explicit mods — FULL. No currency can add a mod.`);
     }
-  }
+  } else lines.push("Affix slots are not inferred from text lines: omitted mods, hybrid lines and special sources can change the count. One-step odds require the complete existing modifier IDs.");
 
   const craftedCount = analyses.filter((a) => a.source === "crafted").length;
   const fracturedCount = analyses.filter((a) => a.source === "fractured").length;
@@ -421,9 +482,9 @@ export async function handleAnalyzeItemMods(
 
   if (craftedCount + fracturedCount + enchantedCount + hybridCount > 0) {
     lines.push("Notes:");
-    if (craftedCount > 0) lines.push(`  - ${craftedCount} bench-crafted mod(s) — matched against ModMaster.lua (the bench-craft pool, deterministic; no tiers/weights).`);
+    if (craftedCount > 0) lines.push(game === "poe2" ? `  - ${craftedCount} crafted annotation(s) with unresolved PoE2 source.` : `  - ${craftedCount} bench-crafted mod(s) — matched against ModMaster.lua (the bench-craft pool, deterministic; no tiers/weights).`);
     if (fracturedCount > 0) lines.push(`  - ${fracturedCount} fractured mod(s) detected — frozen at the rolled value but otherwise from the natural pool.`);
-    if (enchantedCount > 0) lines.push(`  - ${enchantedCount} enchanted mod(s) — labyrinth enchantments, not from the natural pool (not indexed).`);
+    if (enchantedCount > 0) lines.push(`  - ${enchantedCount} enchanted mod(s) — enchantment sources are not indexed by this handler.`);
     if (hybridCount > 0) lines.push(`  - ${hybridCount} hybrid-mod continuation line(s) collapsed into the mod above them.`);
   }
 

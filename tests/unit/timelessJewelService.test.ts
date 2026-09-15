@@ -1,15 +1,22 @@
-import { describe, it, expect } from "@jest/globals";
+import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals";
+import * as loader from '../../src/services/pobTreeDataLoader.js';
+import { legacyJewelTree } from '../fixtures/jewelRadiusFixture.js';
 import {
   parseTimelessJewelMod,
   findAffectedNodes,
   type JewelSocketInfo,
 } from "../../src/services/timelessJewelService";
-import { existsSync } from "fs";
-import { resolve } from "path";
-
-const pobDir = process.env.POB_DIRECTORY ?? resolve(process.cwd(), "..", "PathOfBuilding");
-const hasPobSubmodule = existsSync(resolve(pobDir, "src", "TreeData"));
-const describeIfPob = hasPobSubmodule ? describe : describe.skip;
+let savedGame: string | undefined;
+beforeEach(() => {
+  savedGame = process.env.POE_GAME; process.env.POE_GAME = 'poe1';
+  const tree = legacyJewelTree();
+  tree.nodes['11730'] = { ...tree.nodes['6712'], skill: 11730, group: 1, name: 'Endurance fixture' };
+  tree.nodes['50459'] = { ...tree.nodes['40'], skill: 50459, group: 3, name: 'Distant class start fixture', classesStart: ['Duelist'] };
+  jest.spyOn(loader, 'getPobTreeData').mockReturnValue(tree);
+});
+afterEach(() => {
+  jest.restoreAllMocks(); if (savedGame === undefined) delete process.env.POE_GAME; else process.env.POE_GAME = savedGame;
+});
 
 describe("parseTimelessJewelMod", () => {
   it("parses a Lethal Pride / Kaom jewel", () => {
@@ -36,8 +43,8 @@ describe("parseTimelessJewelMod", () => {
 
   it("parses Glorious Vanity correctly", () => {
     const info = parseTimelessJewelMod("Glorious Vanity", [
-      "Denoted service of 5482 dekhara in the akhara of Doryani",
-      "Passives in radius are Transformed to remain Vaal",
+      "Bathed in the blood of 5482 sacrificed in the name of Doryani",
+      "Passives in radius are Conquered by the Vaal",
       "Historic",
     ]);
     expect(info).not.toBeNull();
@@ -49,7 +56,7 @@ describe("parseTimelessJewelMod", () => {
   it("parses Militant Faith correctly", () => {
     const info = parseTimelessJewelMod("Militant Faith", [
       "Carved to glorify 7000 new faithful converted by High Templar Avarius",
-      "Passives in radius are Devotion",
+      "Passives in radius are Conquered by the Templars",
       "Historic",
     ]);
     expect(info).not.toBeNull();
@@ -61,7 +68,7 @@ describe("parseTimelessJewelMod", () => {
   it("parses Elegant Hubris correctly", () => {
     const info = parseTimelessJewelMod("Elegant Hubris", [
       "Commissioned 9001 coins to commemorate Cadiro",
-      "Passives in radius are Elegant Hubris",
+      "Passives in radius are Conquered by the Eternal Empire",
       "Historic",
     ]);
     expect(info).not.toBeNull();
@@ -73,7 +80,7 @@ describe("parseTimelessJewelMod", () => {
   it("matches Timeless name when item display name has extra suffix", () => {
     // e.g., "Lethal Pride, Timeless Jewel" or "Lethal Pride (Timeless Jewel)"
     const info = parseTimelessJewelMod("Lethal Pride, Timeless Jewel", [
-      "Commanded leadership over 100 warriors under Kaom",
+      "Commanded leadership over 10678 warriors under Kaom",
     ]);
     expect(info).not.toBeNull();
     expect(info?.jewelType).toBe("Lethal Pride");
@@ -88,7 +95,7 @@ describe("parseTimelessJewelMod", () => {
   });
 });
 
-describeIfPob("findAffectedNodes (uses real PoB tree data)", () => {
+describe("findAffectedNodes (deterministic PoE1 fixture)", () => {
   it("returns empty result when no Timeless Jewels are equipped", () => {
     const result = findAffectedNodes(
       [
@@ -138,7 +145,7 @@ describeIfPob("findAffectedNodes (uses real PoB tree data)", () => {
       },
     ];
     // A node from the Duelist start area should be far from socket 26196
-    const allocated = new Set(["50459", "11730"]); // Duelist class start + Endurance
+    const allocated = new Set(["26196", "50459", "11730"]); // socket + distant start + nearby node
     const result = findAffectedNodes(jewels, allocated);
     const tj = result.timelessJewels[0];
     expect(tj.affectedAllocated).toContain("11730");

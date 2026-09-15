@@ -1,6 +1,8 @@
-import { describe, it, expect } from '@jest/globals';
-import { existsSync } from 'fs';
-import { resolve } from 'path';
+import { useLegacyCraftFixture } from '../fixtures/coreCraftLegacy';
+let legacy: ReturnType<typeof useLegacyCraftFixture>;
+beforeAll(() => { legacy = useLegacyCraftFixture(); });
+afterAll(() => legacy.cleanup());
+import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 
 import {
   ensureBasesLoaded,
@@ -10,16 +12,11 @@ import {
   getBasesByTag,
 } from '../../src/services/pobBaseDataLoader';
 
-const pobDir = process.env.POB_DIRECTORY ?? resolve(process.cwd(), '..', 'PathOfBuilding');
-const hasBaseData = existsSync(resolve(pobDir, 'src', 'Data', 'Bases', 'body.lua'));
 
-const describeIfPob = hasBaseData ? describe : describe.skip;
-
-describeIfPob('pobBaseDataLoader', () => {
-  it('parses every equipment base file and exposes hundreds of bases', () => {
+describe('pobBaseDataLoader', () => {
+  it('parses each selected equipment base file', () => {
     ensureBasesLoaded();
-    // ~981 across all equipment files — well above any sane lower bound
-    expect(getBaseCount()).toBeGreaterThan(400);
+    expect(getBaseCount()).toBe(4);
   });
 
   it('returns Astral Plate with the expected tag chain', () => {
@@ -53,7 +50,7 @@ describeIfPob('pobBaseDataLoader', () => {
 
   it('getBasesByTag returns every base sharing the tag', () => {
     const rings = getBasesByTag('ring');
-    expect(rings.length).toBeGreaterThan(15); // PoE has many ring bases
+    expect(rings.map(b => b.name)).toEqual(['Sapphire Ring', 'Ruby Ring']);
     expect(rings.every((b) => b.type === 'Ring')).toBe(true);
   });
 });

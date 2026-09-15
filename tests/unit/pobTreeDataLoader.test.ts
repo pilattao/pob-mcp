@@ -33,27 +33,33 @@ describeIfPob('pobTreeDataLoader', () => {
     expect(node).toBeNull();
   });
 
-  it('returns Endurance correctly for node 11730 (no Lethal Pride leech in base data)', () => {
-    const node = getPobNode('11730');
+  it('returns the known static node for the selected game without jewel-derived stats', () => {
+    const poe2 = getLoadedVersion().startsWith('0_');
+    const node = getPobNode(poe2 ? '31223' : '11730');
     expect(node).not.toBeNull();
-    if (!node) return; // type narrowing
-    expect(node.name).toBe('Endurance');
+    if (!node) return;
     expect(node.isNotable).toBe(true);
-    expect(node.stats).toEqual(['+1 to Maximum Endurance Charges']);
-    // Critical: the leech stat we briefly mis-attributed is a Lethal Pride
-    // transformation and must NOT be in the base data.
-    const hasLeech = node.stats.some((s) => s.toLowerCase().includes('leech'));
-    expect(hasLeech).toBe(false);
+    if (poe2) {
+      expect(node.name).toBe('Crimson Power');
+      expect(node.stats).toEqual(['Gain additional maximum Life equal to 100% of the Item Energy Shield on Equipped Body Armour']);
+    } else {
+      expect(node.name).toBe('Endurance');
+      expect(node.stats).toEqual(['+1 to Maximum Endurance Charges']);
+    }
+    expect(node.stats.some(stat => stat.toLowerCase().includes('leech'))).toBe(false);
   });
 
-  it('coerces empty Lua tables to empty arrays for connection fields', () => {
-    const node = getPobNode('11730');
-    if (!node) return;
+  it("normalizes connection fields without assuming the other game's graph", () => {
+    const poe2 = getLoadedVersion().startsWith('0_');
+    const node = getPobNode(poe2 ? '31223' : '11730')!;
     expect(Array.isArray(node.in)).toBe(true);
     expect(Array.isArray(node.out)).toBe(true);
-    // Endurance is a pendant — has in-edges but no out-edges in current tree
-    expect(node.in.length).toBeGreaterThan(0);
-    expect(node.out.length).toBe(0);
+    if (poe2) {
+      expect([...node.in, ...node.out].map(String)).toContain('50192');
+    } else {
+      expect(node.in.length).toBeGreaterThan(0);
+      expect(node.out.length).toBe(0);
+    }
   });
 
   it('caches tree data — second call is fast', () => {

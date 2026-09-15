@@ -1,3 +1,4 @@
+import { analyzePoe2Items } from "../services/poe2ItemAnalysis.js";
 import type { AnyLuaClient } from "../pobLuaBridge.js";
 import type { BuildService } from "../services/buildService.js";
 import {
@@ -28,6 +29,9 @@ export async function handleAnalyzeItems(
   buildName?: string
 ) {
   try {
+    if (process.env.POE_GAME === 'poe2') {
+      return {content:[{type:'text' as const,text:await analyzePoe2Items(context,buildName)}]};
+    }
     let items: Array<{ slot: string; name?: string; baseName?: string; rarity?: string }> = [];
     let className: string | undefined;
     let ascendClassName: string | undefined;

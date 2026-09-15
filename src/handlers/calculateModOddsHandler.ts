@@ -1,10 +1,12 @@
 /**
  * Handler for the calculate_mod_odds MCP tool.
  *
- * Computes the probability of hitting target modifiers when rolling a base,
+ * In PoE1, computes target probabilities when rolling a base,
  * using real spawn weights (ModItem.lua). Exact for the modeled cases;
  * deliberately does NOT model fossils/harvest/meta-crafts/affix-count
  * variance/currency cost (see the tool description).
+ * PoE2 routes only plain one-step exalt/augment/regal to validated CoE
+ * estimates. Other methods or incomplete source/state produce a coverage gap.
  */
 
 import {
@@ -29,7 +31,9 @@ import {
   probAllTargetsDrawn,
   type EligiblePool,
   type GroupInfo,
+  calculatePoe2OneStepOdds,
 } from "../services/oddsCalculator.js";
+import { resolvePobDataLocation } from "../services/pobDataPath.js";
 
 export interface OddsTargetInput {
   stat?: string;
@@ -41,7 +45,10 @@ export interface CalculateModOddsArgs {
   base_name: string;
   ilvl: number;
   targets: OddsTargetInput[];
-  method?: "chaos" | "alt" | "essence";
+  method?: "chaos" | "alt" | "essence" | "exalt" | "augment" | "regal";
+  /** PoE2 one-step operations require actual rarity and the complete affix list. */
+  item_rarity?: "magic" | "rare";
+  existing_mod_ids?: string[];
   essence_name?: string;
   prefix_count?: number;
   suffix_count?: number;
@@ -103,10 +110,36 @@ function textResult(text: string, isError = false) {
 
 export async function handleCalculateModOdds(args: CalculateModOddsArgs) {
   if (!args.base_name) return textResult("Error: base_name is required.", true);
-  if (typeof args.ilvl !== "number") return textResult("Error: ilvl (number) is required.", true);
+  if (!Number.isSafeInteger(args.ilvl) || args.ilvl < 1 || args.ilvl > 100) return textResult("Error: ilvl must be an integer from 1 to 100.", true);
   if (!Array.isArray(args.targets) || args.targets.length === 0) {
     return textResult("Error: targets must be a non-empty array, each with a `stat` keyword or `group`, optional `min_tier`.", true);
   }
+
+  let game: "poe1" | "poe2";
+  try { game = resolvePobDataLocation().game; }
+  catch (error) { return textResult(`Error selecting PoB game data: ${error instanceof Error ? error.message : String(error)}`, true); }
+  if (game === "poe2") {
+    try {
+      ensureBasesLoaded();
+      const base = getBase(args.base_name);
+      if (!base) throw new Error(`Native PoE2 base '${args.base_name}' not found. No approximate class mapping is used for odds.`);
+      const result = calculatePoe2OneStepOdds(base, args.ilvl, args);
+      if (args.raw_json) return textResult(JSON.stringify(result, null, 2));
+      return textResult([
+        `=== PoE2: one ${result.method} on ${base.name} ===`,
+        `Conditional probability estimate: ${(result.combined_probability * 100).toFixed(4)}%`,
+        `CoE weights: ${result.pool.qualifying_weight} / ${result.pool.total_weight}; ${result.pool.eligible_modifiers} eligible modifiers.`,
+        `Source: ${result.source.url} | dataset ${result.source.patch} | fetched ${result.source.fetched_at}`,
+        ...result.assumptions,
+      ].join("\n"));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return textResult(args.raw_json ? JSON.stringify({ game: "poe2", coverage: "gap", code: "POE2_ODDS_COVERAGE_GAP",
+        combined_probability: null, estimated_attempts: null, reason: message }, null, 2)
+        : `PoE2 crafting odds coverage gap: ${message}\nNo probability was calculated.`, true);
+    }
+  }
+  if (args.method && !["chaos", "alt", "essence"].includes(args.method)) return textResult("Unsupported PoE1 rolling method.", true);
 
   try {
     ensureLoaded();
@@ -225,7 +258,7 @@ export async function handleCalculateModOdds(args: CalculateModOddsArgs) {
   const pPrefix = probAllTargetsDrawn(prefixGroups, prefixTargets.map((t) => t.group), prefixCount);
   const pSuffix = probAllTargetsDrawn(suffixGroups, suffixTargets.map((t) => t.group), suffixCount);
   const tierFactor = resolved.reduce((acc, r) => acc * r.conditionalFactor, 1);
-  const combined = pPrefix * pSuffix * tierFactor;
+  const combined = warnings.length > 0 ? 0 : pPrefix * pSuffix * tierFactor;
   const attempts = combined > 0 ? 1 / combined : Infinity;
 
   if (args.raw_json) {

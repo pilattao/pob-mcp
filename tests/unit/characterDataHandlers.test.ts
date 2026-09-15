@@ -89,6 +89,26 @@ mode: analysis
 // ── compute_constraint_margins ────────────────────────────────────────────────
 
 describe('handleComputeConstraintMargins', () => {
+  it('converts a native critical multiplier factor only for percent thresholds', async () => {
+    const profilePath = path.join(tmpDir, 'crit-profile.md');
+    await fs.writeFile(profilePath, '| Stat | Tier | Threshold | Current | Margin | Notes |\n| --- | --- | --- | --- | --- | --- |\n| Crit Multiplier | Hard | >= 400% | | | |\n| Crit Multiplier | Soft | >= 4 | | | |\n');
+    const ctx = makeContext(makeLuaClient({ getStats: jest.fn<() => Promise<any>>().mockResolvedValue({CritMultiplier:4.5}) }));
+    const text=(await handleComputeConstraintMargins(ctx,profilePath,false)).content[0].text;
+    expect(text).toContain('current 450%, margin +50%');
+    expect(text).toContain('current 4.5, margin +0.5');
+  });
+
+  it('evaluates PoE2 Spirit resources and keeps missing evidence explicit', async () => {
+    const profilePath = path.join(tmpDir, 'spirit-profile.md');
+    await fs.writeFile(profilePath, '| Stat | Tier | Threshold | Current | Margin | Notes |\n| --- | --- | --- | --- | --- | --- |\n| Spirit | Hard | >= 140 | | | |\n| Spirit unreserved | Hard | >= 1 | | | |\n| Mystery | Hard | >= 1 | | | |\n');
+    const client = makeLuaClient({ getStats: jest.fn<() => Promise<any>>().mockResolvedValue({ Spirit: 144, SpiritUnreserved: 4 }) });
+    const result = await handleComputeConstraintMargins(makeContext(client), profilePath, false);
+    const text = result.content[0].text;
+    expect(text).toContain('current 144, margin +4');
+    expect(text).toContain('current 4, margin +3');
+    expect(text).toContain('not fully verified');
+  });
+
   it('computes margins for numeric thresholds from live stats', async () => {
     const profilePath = path.join(tmpDir, 'build-profile.md');
     await fs.writeFile(profilePath, PROFILE_MD);

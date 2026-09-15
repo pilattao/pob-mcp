@@ -29,6 +29,7 @@ export interface ToolSchema {
  * Get all tool schemas for registration with the MCP server
  */
 export function getToolSchemas(): ToolSchema[] {
+  const poe2 = process.env.POE_GAME === "poe2";
   return [
     {
       name: "analyze_build",
@@ -317,7 +318,7 @@ export function getToolSchemas(): ToolSchema[] {
     },
     {
       name: "evaluate_threshold_jewels",
-      description: "Evaluate each socketed jewel's 'With at least N <Attribute> in Radius' threshold mods against the build's current tree. Reports whether each threshold is triggered, the current attribute sum in radius, and the margin (positive = triggered with headroom, negative = short by N points). Useful for jewel shopping ('would this Brawn fit my tree?') and for diagnosing missing effects ('I think I have +6% Reservation Efficiency from Conqueror's Efficiency, but the threshold isn't met'). Phase-1 scope: handles Str/Dex/Int attribute thresholds; 'Notable in Radius' and 'Total Attributes' patterns are Phase-2. Reads from the live build via PoB.",
+      description: "Scan equipped jewels for attribute-threshold syntax using the exact active native tree. Supported legacy PoE1 thresholds count printed base attributes on all eligible nodes, including unallocated nodes, using the item radius where supplied. Reports threshold, total and margin; transformations and overrides are outside the static calculation. PoE2 attribute-threshold evaluation is unavailable unless a native counterpart and its mechanics are established; retained legacy parser patterns are not proof of support.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -344,7 +345,7 @@ export function getToolSchemas(): ToolSchema[] {
     },
     {
       name: "calculate_mod_odds",
-      description: "Compute the probability of hitting target modifiers when rolling a base item, using the game's real spawn weights (from ModItem.lua). Answers 'what are my odds of T1 Life + T1 Fire Resistance on this base at ilvl 86?'. EXACT for the modeled cases: mods drawn weighted from the prefix/suffix pool, one mod per mod-group (sampling without replacement at group level), prefixes/suffixes independent given the slot counts.\n\nEach target is `{stat}` (keyword, e.g. 'maximum Life' — must resolve to a single mod group or you'll get a disambiguation list) OR `{group}` (exact PoB group key, e.g. 'IncreasedLife'), plus optional `min_tier` (worst acceptable tier rank; e.g. 2 = T1 or T2). `method`: 'chaos' (full rare reroll, default, 3/3 slots), 'alt' (magic item, 1 prefix + 1 suffix), or 'essence' (pass `essence_name` — the forced mod is guaranteed and pre-placed). Override slot assumptions with `prefix_count`/`suffix_count` (0–3).\n\nOutput: per-target weight share, P(prefix targets), P(suffix targets), tier-filter factor, combined probability, and estimated full rerolls (1/P). LIMITATIONS (deliberately not modeled — use Craft of Exile for these): fossil/harvest weight changes, meta-craft sequences, exact per-orb affix-count variance, and currency cost.",
+      description: poe2 ? "Estimate one plain PoE2 exalt, augment or regal action using a validated Craft of Exile cache. Requires actual item rarity and the complete existing affix ID list. Native PoB 1/0 flags are eligibility, not probabilities. Targets use CoE family names or coe:<group-id>. Unsupported methods, effects, source patches and ambiguous mappings produce no numerical odds. Repeated attempts and currency cost are not modeled." : "Compute the probability of hitting target modifiers when rolling a base item, using the game's real spawn weights (from ModItem.lua). Answers 'what are my odds of T1 Life + T1 Fire Resistance on this base at ilvl 86?'. EXACT for the modeled cases: mods drawn weighted from the prefix/suffix pool, one mod per mod-group (sampling without replacement at group level), prefixes/suffixes independent given the slot counts.\n\nEach target is `{stat}` (keyword, e.g. 'maximum Life' — must resolve to a single mod group or you'll get a disambiguation list) OR `{group}` (exact PoB group key, e.g. 'IncreasedLife'), plus optional `min_tier` (worst acceptable tier rank; e.g. 2 = T1 or T2). `method`: 'chaos' (full rare reroll, default, 3/3 slots), 'alt' (magic item, 1 prefix + 1 suffix), or 'essence' (pass `essence_name` — the forced mod is guaranteed and pre-placed). Override slot assumptions with `prefix_count`/`suffix_count` (0–3).\n\nOutput: per-target weight share, P(prefix targets), P(suffix targets), tier-filter factor, combined probability, and estimated full rerolls (1/P). LIMITATIONS (deliberately not modeled — use Craft of Exile for these): fossil/harvest weight changes, meta-craft sequences, exact per-orb affix-count variance, and currency cost.",
       inputSchema: {
         type: "object",
         properties: {
@@ -356,19 +357,21 @@ export function getToolSchemas(): ToolSchema[] {
               type: "object",
               properties: {
                 stat: { type: "string", description: "Stat-text keyword (must resolve to one mod group; ambiguous keywords return a disambiguation list)." },
-                group: { type: "string", description: "Exact PoB mod-group key (e.g. 'IncreasedLife', 'FireResistance'). Use this to disambiguate." },
+                group: { type: "string", description: poe2 ? "CoE family name, e.g. Strength, or coe:<group-id>." : "Exact PoB mod-group key." },
                 min_tier: { type: "number", description: "Worst acceptable tier rank (1=best). e.g. 2 means T1 or T2 acceptable. Omit = any tier." },
               },
             },
             description: "Target mods you want to hit (1 or more).",
           },
-          method: { type: "string", enum: ["chaos", "alt", "essence"], description: "Rolling method. 'chaos' = full rare reroll (default). 'alt' = magic 1p/1s. 'essence' = forced mod (needs essence_name)." },
+          method: { type: "string", enum: poe2 ? ["exalt", "augment", "regal"] : ["chaos", "alt", "essence"], description: poe2 ? "Explicit one-step PoE2 operation; no default reroll is assumed." : "PoE1 chaos, alteration or essence model." },
           essence_name: { type: "string", description: "Required for method 'essence' (e.g. 'Deafening Essence of Greed'). The forced mod is guaranteed." },
           prefix_count: { type: "number", description: "Assumed prefix slots filled (0–3, default 3 for chaos / 1 for alt)." },
           suffix_count: { type: "number", description: "Assumed suffix slots filled (0–3, default 3 for chaos / 1 for alt)." },
+          item_rarity: { type: "string", enum: ["magic", "rare"], description: "PoE2 current rarity." },
+          existing_mod_ids: { type: "array", items: {type:"string"}, description: "Complete current explicit affix CoE keys, even if empty. Slot counts alone are insufficient." },
           raw_json: { type: "boolean", description: "Return structured JSON. Default false." },
         },
-        required: ["base_name", "ilvl", "targets"],
+        required: poe2 ? ["base_name", "ilvl", "targets", "method", "item_rarity", "existing_mod_ids"] : ["base_name", "ilvl", "targets"],
       },
     },
     {
@@ -458,12 +461,12 @@ export function getToolSchemas(): ToolSchema[] {
     },
     {
       name: "get_atlas_node",
-      description: "Look up a single Atlas of Worlds tree node by ID. Returns name, stats, type (Notable/Keystone/Jewel Socket/Mastery/Travel/Wormhole/Ascendancy), positional fields, and in/out connections. Data sourced from `reference_data/atlastree/data.json` (GGG's official atlas-export, mirrored in our community fork submodule). The data_patches.json overlay is applied if present. Unlike `get_tree_node` for the passive tree, there's no jewel-transformation layer — atlas doesn't have Timeless-Jewel-equivalent mechanics. Variants supported: `default`, `league` (current league), `ruthless`, `ruthless-league`.",
+      description: poe2 ? "Read a PoE2 atlas node from the RePoE export, including source version, checksum, subtree and graph links. Only the default PoE2 graph is supported. Selector effects and player allocation are not supplied by this dataset." : "Look up a single Atlas of Worlds tree node by ID. Returns name, stats, type (Notable/Keystone/Jewel Socket/Mastery/Travel/Wormhole/Ascendancy), positional fields, and in/out connections. Data sourced from `reference_data/atlastree/data.json` (GGG's official atlas-export, mirrored in our community fork submodule). The data_patches.json overlay is applied if present. Unlike `get_tree_node` for the passive tree, there's no jewel-transformation layer — atlas doesn't have Timeless-Jewel-equivalent mechanics. Variants supported: `default`, `league` (current league), `ruthless`, `ruthless-league`.",
       inputSchema: {
         type: "object",
         properties: {
-          node_id: { type: "string", description: "Atlas node ID (e.g., '1670' for Fortune's Favour)." },
-          variant: { type: "string", description: "Atlas tree variant. Defaults to 'default' (standard atlas).", enum: ["default", "league", "ruthless", "ruthless-league"] },
+          node_id: { type: "string", description: poe2 ? "PoE2 atlas node ID from search_atlas_nodes." : "Atlas node ID (e.g., '1670' for Fortune's Favour)." },
+          variant: { type: "string", description: "Atlas tree variant. Defaults to 'default' (standard atlas).", enum: poe2 ? ["default"] : ["default", "league", "ruthless", "ruthless-league"] },
           raw_json: { type: "boolean", description: "Return raw JSON node object instead of a human-readable summary. Default false." },
         },
         required: ["node_id"],
@@ -471,34 +474,34 @@ export function getToolSchemas(): ToolSchema[] {
     },
     {
       name: "search_atlas_nodes",
-      description: "Search the atlas tree for nodes matching a keyword (name or stat text). Optional node-type filter (`keystone`, `notable`, `jewel`, `mastery`, `wormhole`, `ascendancy`, `normal`). Useful for finding all atlas notables related to a mechanic (e.g., 'breach', 'expedition', 'heist'). Variant-aware (default/league/ruthless/ruthless-league).",
+      description: poe2 ? "Search native PoE2 atlas node names and stat text, with source/version metadata. Display-only decorations are excluded. Only variant default is supported." : "Search the atlas tree for nodes matching a keyword (name or stat text). Optional node-type filter (`keystone`, `notable`, `jewel`, `mastery`, `wormhole`, `ascendancy`, `normal`). Useful for finding all atlas notables related to a mechanic (e.g., 'breach', 'expedition', 'heist'). Variant-aware (default/league/ruthless/ruthless-league).",
       inputSchema: {
         type: "object",
         properties: {
           query: { type: "string", description: "Substring to match against node names or stat text (case-insensitive)." },
           node_type: { type: "string", description: "Filter to a node type. Omit or pass 'any' for no filter.", enum: ["keystone", "notable", "jewel", "mastery", "wormhole", "ascendancy", "normal", "any"] },
           limit: { type: "number", description: "Max results (default 30)." },
-          variant: { type: "string", description: "Atlas tree variant. Defaults to 'default'.", enum: ["default", "league", "ruthless", "ruthless-league"] },
+          variant: { type: "string", description: "Atlas tree variant. Defaults to 'default'.", enum: poe2 ? ["default"] : ["default", "league", "ruthless", "ruthless-league"] },
         },
         required: ["query"],
       },
     },
     {
       name: "find_atlas_path_to_node",
-      description: "Find the shortest path of passive nodes between two atlas tree nodes (BFS over the undirected in/out graph). The atlas tree's allocation state isn't visible to our tools via the public PoE API, so this tool requires an explicit `from_node_id` — there's no 'from build frontier' mode like in the passive-tree equivalent. Use it to measure distance between two notables, or to plan a route from your current allocation frontier (which you'd tell the tool manually) to a target notable.",
+      description: poe2 ? "Find an undirected graph path between explicit PoE2 atlas node IDs. Excludes display-only nodes. Distance is graph edges, not verified allocation cost; quest gates and current allocation remain unknown." : "Find the shortest path of passive nodes between two atlas tree nodes (BFS over the undirected in/out graph). The atlas tree's allocation state isn't visible to our tools via the public PoE API, so this tool requires an explicit `from_node_id` — there's no 'from build frontier' mode like in the passive-tree equivalent. Use it to measure distance between two notables, or to plan a route from your current allocation frontier (which you'd tell the tool manually) to a target notable.",
       inputSchema: {
         type: "object",
         properties: {
           target_node_id: { type: "string", description: "Destination atlas node ID." },
           from_node_id: { type: "string", description: "Source atlas node ID (required — atlas allocation isn't API-visible)." },
-          variant: { type: "string", description: "Atlas tree variant. Defaults to 'default'.", enum: ["default", "league", "ruthless", "ruthless-league"] },
+          variant: { type: "string", description: "Atlas tree variant. Defaults to 'default'.", enum: poe2 ? ["default"] : ["default", "league", "ruthless", "ruthless-league"] },
         },
         required: ["target_node_id", "from_node_id"],
       },
     },
     {
       name: "list_radius_effect_jewels",
-      description: "Scan equipped jewels for 'in Radius' mods that aren't Timeless-Jewel transformations and aren't attribute thresholds — i.e. the long tail: Energy From Within, Healthy Mind, Fertile Mind, Might of the Meek, Brute Force Solution, etc. For each match, reports the radius mod lines, a best-effort category (transform / grant / multiplier / other), and the allocated nodes in the jewel's radius. Useful for build-comparison and for noticing when a radius jewel is socketed but not actually affecting much of the tree. PoB already applies the numeric effect in lua_get_stats totals; this tool surfaces WHICH jewels and WHICH nodes so the caller can reason about scope.",
+      description: "Scan equipped jewels against the exact active native tree and weapon set. For PoE2, report supported Time-Lost node-type targets and the selected Controlled Metamorphosis ring, including inner/outer bounds, eligible allocated targets and eligible unallocated nodes. Inactive sockets and unavailable or ambiguous rules are explicit. This is node-scope reporting, not a numeric effect or jewel-limit calculation. Timeless conquest and attribute thresholds have separate queries.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -559,7 +562,7 @@ export function getToolSchemas(): ToolSchema[] {
     },
     {
       name: "find_jewel_affected_nodes",
-      description: "Identify which allocated passive nodes are being TRANSFORMED in-game by socketed Timeless Jewels (Lethal Pride, Glorious Vanity, Militant Faith, Brutal Restraint, Elegant Hubris). Phase-1 scope: identifies AFFECTED nodes by computing each Timeless Jewel's radius and listing the allocated nodes inside it — does NOT yet render the transformed stats. Primary use case: when an in-game tooltip doesn't match `get_tree_node` output, this tool answers \"is the discrepancy attributable to a jewel?\" and prevents false patches (the Endurance/Lethal-Pride case from 2026-05-25). Requires PoB Lua client (live TCP build or loaded XML).",
+      description: "Read-only Timeless jewel awareness for the current native tree and weapon set. Identifies supported PoE1 jewels and catalog-verified PoE2 Heroic Tragedy / Undying Hate, including seed, leader and native radius. Reports geometric candidates and current get_node_state evidence for up to 30 allocated candidates, with explicit unread or unavailable coverage. Conquest metadata does not prove complete seed-dependent transformation support. No transformations are calculated independently.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -637,12 +640,12 @@ export function getLuaToolSchemas(): any[] {
     },
     {
       name: "lua_new_build",
-      description: "Create a new blank build with specified class and ascendancy. In TCP mode this opens the new build in the running PoB GUI. Auto-starts the Lua bridge if needed. Classes and ascendancies (PoE1): Scion: Ascendant | Marauder: Juggernaut, Berserker, Chieftain | Ranger: Raider, Deadeye, Pathfinder | Witch: Occultist, Elementalist, Necromancer | Duelist: Slayer, Gladiator, Champion | Templar: Inquisitor, Hierophant, Guardian | Shadow: Assassin, Trickster, Saboteur",
+      description: poe2 ? "Create a blank PoB2 build. Class and ascendancy names are validated against the installed native tree before opening; creation completes only after that class is selected and calculated. No PoE1 IDs or fallback class are used." : "Create a new blank build with specified class and ascendancy. In TCP mode this opens the new build in the running PoB GUI. Auto-starts the Lua bridge if needed. Classes and ascendancies (PoE1): Scion: Ascendant | Marauder: Juggernaut, Berserker, Chieftain | Ranger: Raider, Deadeye, Pathfinder | Witch: Occultist, Elementalist, Necromancer | Duelist: Slayer, Gladiator, Champion | Templar: Inquisitor, Hierophant, Guardian | Shadow: Assassin, Trickster, Saboteur",
       inputSchema: {
         type: "object",
         properties: {
-          class_name: { type: "string", description: "Class name (e.g., 'Witch', 'Marauder')" },
-          ascendancy: { type: "string", description: "Ascendancy class name (optional)" },
+          class_name: { type: "string", description: poe2 ? "Exact class name from the installed PoB2 tree, e.g. Witch or Sorceress." : "Class name (e.g., 'Witch', 'Marauder')" },
+          ascendancy: { type: "string", description: poe2 ? "Exact ascendancy belonging to that installed PoB2 class, e.g. Blood Mage for Witch. Omit or use None for unascended." : "Ascendancy class name (optional)" },
         },
         required: ["class_name"],
       },
@@ -680,16 +683,21 @@ export function getLuaToolSchemas(): any[] {
             type: "string",
             description: "Name of the build file to load",
           },
+          build_xml: { type: "string", description: "Complete build XML. For get_character_pob, pass its pob_xml field, not the JSON envelope. Preserves all sets and extensions." },
+          name: { type: "string", description: "Optional display name for the opened build." },
         },
-        required: ["build_name"],
+        oneOf: [{ required: ["build_name"] }, { required: ["build_xml"] }],
       },
     },
     {
       name: "lua_import_character",
-      description: "Import a character from the official PoE API into the currently loaded build (replaces tree, items, and gems). Requires a build loaded via lua_load_build or lua_new_build. If account_name is omitted, falls back to POE_ACCOUNT_NAME. Set POE_SESSION_ID env var for private profiles.",
+      description: poe2 ? "Load a complete public PoB2 character snapshot. Call get_character_pob separately and pass its pob_xml field. Its pob_code and source metadata remain with that public result. This preserves the complete build and all sets; selective account/API imports are not supported by this public PoE2 route." : "Import a character from the official PoE API into the currently loaded build (replaces tree, items, and gems). Requires a build loaded via lua_load_build or lua_new_build. If account_name is omitted, falls back to POE_ACCOUNT_NAME. Set POE_SESSION_ID env var for private profiles.",
       inputSchema: {
         type: "object",
-        properties: {
+        properties: poe2 ? {
+          pob_xml: { type: "string", description: "The actual pob_xml string returned by get_character_pob, without the JSON envelope." },
+          character_name: { type: "string", description: "Optional display name for this public snapshot; no account lookup is performed." },
+        } : {
           account_name: {
             type: "string",
             description: "PoE account name including discriminator (e.g., 'account#1234'). Optional when POE_ACCOUNT_NAME is set.",
@@ -730,7 +738,7 @@ export function getLuaToolSchemas(): any[] {
             enum: ["None", "Alira", "Kraityn", "Oak"],
           },
         },
-        required: ["character_name"],
+        required: poe2 ? ["pob_xml"] : ["character_name"],
       },
     },
     {
@@ -764,8 +772,12 @@ export function getLuaToolSchemas(): any[] {
     },
     {
       name: "get_context_usage",
-      description: "Returns real-time token usage for the current Claude Code session: how many tokens are in context, how close to the window limit, and a breakdown of cached vs new tokens. Reads from the Claude Code session JSONL log (~/.claude/projects/). Use this before loading heavy data to gauge available headroom.",
-      inputSchema: { type: "object", properties: {} },
+      description: "Read usage metadata from an explicitly selected Codex or Claude transcript whose session ID matches thread_id. Requires client, transcript_path and thread_id together. No arguments returns unavailable without filesystem access; never discovers or reads another session automatically. Cached input is a subset; cumulative usage is distinct from context occupancy and account limits.",
+      inputSchema: { type: "object", properties: {
+        client: { type: "string", enum: ["codex", "claude"] },
+        transcript_path: { type: "string", description: "Explicit absolute path to the current authorized session transcript." },
+        thread_id: { type: "string", description: "Expected current session ID; must match the transcript identity." },
+      } },
     },
     {
       name: "list_specs",
@@ -1004,7 +1016,7 @@ export function getLuaToolSchemas(): any[] {
     },
     {
       name: "lua_get_build_info",
-      description: "Get metadata about the currently loaded build: name, character level, class, ascendancy, and tree version. Useful to confirm which build is active after lua_load_build or lua_new_build. Classes and ascendancies (PoE1): Scion: Ascendant | Marauder: Juggernaut, Berserker, Chieftain | Ranger: Raider, Deadeye, Pathfinder | Witch: Occultist, Elementalist, Necromancer | Duelist: Slayer, Gladiator, Champion | Templar: Inquisitor, Hierophant, Guardian | Shadow: Assassin, Trickster, Saboteur",
+      description: poe2 ? "Get actual metadata from the loaded PoB2 build: name, character level, class, ascendancy and tree version. Pending native mode transitions return an error." : "Get metadata about the currently loaded build: name, character level, class, ascendancy, and tree version. Useful to confirm which build is active after lua_load_build or lua_new_build. Classes and ascendancies (PoE1): Scion: Ascendant | Marauder: Juggernaut, Berserker, Chieftain | Ranger: Raider, Deadeye, Pathfinder | Witch: Occultist, Elementalist, Necromancer | Duelist: Slayer, Gladiator, Champion | Templar: Inquisitor, Hierophant, Guardian | Shadow: Assassin, Trickster, Saboteur",
       inputSchema: {
         type: "object",
         properties: {},
@@ -1563,7 +1575,7 @@ export function getOptimizationToolSchemas(): any[] {
     },
     {
       name: "analyze_items",
-      description: "Analyze equipped items and suggest upgrades or improvements",
+      description: process.env.POE_GAME === "poe2" ? "Read selected PoE2 items, exact modifiers and measured constraints from live state or a requested XML file. Missing stats stay unknown. Candidate upgrade rankings require native comparisons and current prices." : "Analyze equipped items and suggest upgrades or improvements",
       inputSchema: {
         type: "object",
         properties: {
@@ -1572,7 +1584,7 @@ export function getOptimizationToolSchemas(): any[] {
             description: "Build to analyze",
           },
         },
-        required: ["build_name"],
+        required: process.env.POE_GAME === "poe2" ? [] : ["build_name"],
       },
     },
     {
@@ -1614,10 +1626,11 @@ export function getOptimizationToolSchemas(): any[] {
  * Get configuration tool schemas (Phase 9)
  */
 export function getConfigToolSchemas(): any[] {
+  const poe2 = process.env.POE_GAME === "poe2";
   return [
     {
       name: "get_config",
-      description: "View current configuration state including charge usage, enemy settings, and active conditions. Requires Lua bridge with a loaded build.",
+      description: poe2 ? "Read the selected native PoB2 config set, effective enemy level and raw inputs. Initialized flags do not establish applicability or uptime. Requires a live build." : "View current configuration state including charge usage, enemy settings, and active conditions. Requires Lua bridge with a loaded build.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -1625,19 +1638,15 @@ export function getConfigToolSchemas(): any[] {
     },
     {
       name: "set_config",
-      description: "Modify any Path of Building Config-tab option. `config_name` must be PoB's internal var name; an unrecognised name is rejected with an error (never silently ignored), and the response reports the value PoB actually STORED — if it says NOT applied, do not trust a sim that assumes it. Common keys — Charges: usePowerCharges, useFrenzyCharges, useEnduranceCharges | Conditions: conditionFortify, conditionLeeching, conditionOnFullLife | Buffs: buffOnslaught, minionbuffUnholyMight | Ailments/debuffs: multiplierWitheredStackCount | Enemy: enemyIsBoss ('Shaper'/'Pinnacle'/false), enemyLevel | Build: bandit ('None'/'Oak'/'Alira'/'Kraityn'), pantheonMajorGod, pantheonMinorGod. Call get_config to see all currently-set values.",
+      description: "Apply explicit native configuration inputs and verify stored values in the same selected config set. Provide a flat config object or one config_name/value pair. Unknown native options are rejected before writes. PoE2 rejects Bandit/Pantheon fields. Read get_config for actual inputs and effective values.",
       inputSchema: {
         type: "object",
         properties: {
-          config_name: {
-            type: "string",
-            description: "Name of configuration input to change (e.g., 'usePowerCharges', 'enemyIsBoss', 'conditionFortify')",
-          },
-          value: {
-            description: "New value (boolean for most flags, number for counts)",
-          },
+          config_name: { type: "string", description: "Exact native ConfigOptions variable, e.g. enemyLevel." },
+          value: { type: ["boolean", "number", "string"], description: "Explicit value for config_name." },
+          config: { type: "object", minProperties: 1, additionalProperties: {type: ["boolean", "number", "string"]}, description: "Flat batch of explicit native inputs. Unlisted inputs are retained." },
         },
-        required: ["config_name", "value"],
+        oneOf: [{required:["config_name","value"]},{required:["config"]}],
       },
     },
     {
@@ -1657,29 +1666,29 @@ export function getConfigToolSchemas(): any[] {
     },
     {
       name: "set_enemy_stats",
-      description: "Configure enemy parameters for DPS calculations. Test against different enemy types (map boss, Shaper, Maven). Requires Lua bridge.",
+      description: "Apply only the supplied enemy parameters to the native config and verify readback. Omitted fields remain unchanged; zero resistances are explicit valid values. Effective enemy level can differ from the stored override.",
       inputSchema: {
         type: "object",
         properties: {
           level: {
             type: "number",
-            description: "Enemy level (default: 84)",
+            description: "Explicit enemy level override",
           },
           fire_resist: {
             type: "number",
-            description: "Fire resistance % (default: 40)",
+            description: "Explicit fire resistance %",
           },
           cold_resist: {
             type: "number",
-            description: "Cold resistance % (default: 40)",
+            description: "Explicit cold resistance %",
           },
           lightning_resist: {
             type: "number",
-            description: "Lightning resistance % (default: 40)",
+            description: "Explicit lightning resistance %",
           },
           chaos_resist: {
             type: "number",
-            description: "Chaos resistance % (default: 20)",
+            description: "Explicit chaos resistance %",
           },
           armor: {
             type: "number",
@@ -1694,7 +1703,7 @@ export function getConfigToolSchemas(): any[] {
     },
     {
       name: "save_config_preset",
-      description: "Save the current configuration (charges, conditions, enemy settings) as a named preset for quick reuse",
+      description: "Save the selected config with game provenance. PoE2 presets contain explicit XML input overrides and do not copy initialized defaults.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1708,7 +1717,7 @@ export function getConfigToolSchemas(): any[] {
     },
     {
       name: "load_config_preset",
-      description: "Load a previously saved configuration preset, restoring all charge, condition, and enemy settings at once",
+      description: "Apply a saved preset for the current game as an explicit input patch. Unlisted inputs remain unchanged; cross-game presets are rejected.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1722,7 +1731,7 @@ export function getConfigToolSchemas(): any[] {
     },
     {
       name: "list_config_presets",
-      description: "List all saved configuration presets",
+      description: "List saved presets belonging to the current game.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -2308,7 +2317,7 @@ export function getBuildGoalsToolSchemas(): any[] {
   return [
     {
       name: "get_build_issues",
-      description: "Quick issue scan: uncapped resistances, low life, over-reserved mana, incomplete spell suppression. Lighter than validate_build. Use this for a fast check; use validate_build when you want full analysis including flask immunities and damage scaling. Do NOT call both.",
+      description: "Quick PoE2 issue scan using the live build XML and selected native outputs: configured resistance deficits, actual skill resource costs, Spirit reservation, attribute requirements and passive spending. Includes Life, ES, Mana, Spirit and Ward. Missing data and unassessed gear/socket completeness stay unknown; this is not a full viability assessment. Already included by lua_load_build. Explicit POE_GAME=poe1 retains the legacy scan.",
       inputSchema: {
         type: "object",
         properties: {},

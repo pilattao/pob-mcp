@@ -1,6 +1,8 @@
-import { describe, it, expect } from '@jest/globals';
-import { existsSync } from 'fs';
-import { resolve } from 'path';
+import { useLegacyCraftFixture } from '../fixtures/coreCraftLegacy';
+let legacy: ReturnType<typeof useLegacyCraftFixture>;
+beforeAll(() => { legacy = useLegacyCraftFixture(); });
+afterAll(() => legacy.cleanup());
+import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 import { probAllTargetsDrawn, buildEligiblePool } from '../../src/services/oddsCalculator';
 import { getBase, ensureBasesLoaded } from '../../src/services/pobBaseDataLoader';
 import { ensureLoaded } from '../../src/services/pobModDataLoader';
@@ -71,13 +73,8 @@ describe('probAllTargetsDrawn (pure)', () => {
 });
 
 // --- Pool builder: needs PoB submodule ---
-const pobDir = process.env.POB_DIRECTORY ?? resolve(process.cwd(), '..', 'PathOfBuilding');
-const hasData =
-  (existsSync(resolve(pobDir, 'src', 'Data', 'ModExplicit.lua')) || existsSync(resolve(pobDir, 'src', 'Data', 'ModItem.lua'))) &&
-  existsSync(resolve(pobDir, 'src', 'Data', 'Bases', 'body.lua'));
-const describeIfPob = hasData ? describe : describe.skip;
 
-describeIfPob('buildEligiblePool', () => {
+describe('buildEligiblePool', () => {
   it('builds prefix/suffix groups for a base at ilvl', () => {
     ensureLoaded();
     ensureBasesLoaded();
@@ -85,8 +82,8 @@ describeIfPob('buildEligiblePool', () => {
     expect(base).not.toBeNull();
     if (!base) return;
     const pool = buildEligiblePool(base, 86);
-    expect(pool.prefixes.length).toBeGreaterThan(3);
-    expect(pool.suffixes.length).toBeGreaterThan(3);
+    expect(pool.prefixes.map(g => g.group)).toEqual(['IncreasedLife', 'ArmourAndLife', 'IncreasedMana', 'ArmourPercent']);
+    expect(pool.suffixes.map(g => g.group)).toEqual(['Strength', 'FireResistance', 'ColdResistance']);
     expect(pool.prefixWeight).toBeGreaterThan(0);
     // IncreasedLife should be a prefix group on a body armour
     expect(pool.prefixes.some((g) => g.group === 'IncreasedLife')).toBe(true);

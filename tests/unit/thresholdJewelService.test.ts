@@ -1,4 +1,10 @@
-import { describe, it, expect } from "@jest/globals";
+import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals";
+import * as loader from '../../src/services/pobTreeDataLoader.js';
+import { legacyJewelTree } from '../fixtures/jewelRadiusFixture.js';
+
+let savedGame: string | undefined;
+beforeEach(() => { savedGame = process.env.POE_GAME; process.env.POE_GAME = 'poe1'; jest.spyOn(loader, 'getPobTreeData').mockReturnValue(legacyJewelTree()); });
+afterEach(() => { jest.restoreAllMocks(); if (savedGame === undefined) delete process.env.POE_GAME; else process.env.POE_GAME = savedGame; });
 import {
   parseThresholdMods,
   evaluateThreshold,
@@ -55,19 +61,14 @@ describe("parseThresholdMods", () => {
   });
 });
 
-describe("evaluateThreshold (uses real PoB tree data)", () => {
-  // Build a small allocated-nodes set with deliberate Strength concentration.
-  // The PoB tree has thousands of nodes; we only assert on whether
-  // sumAttributeInRadius is called correctly through evaluateThreshold.
+describe("evaluateThreshold (deterministic PoE1 fixture)", () => {
   const threshold: ThresholdMod = {
     attribute: "Strength",
     requiredAmount: 40,
     rawMod: "With at least 40 Strength in Radius, X",
   };
 
-  it("returns triggered=false when allocated set has nothing in radius", () => {
-    // 7162 is a known node ID in the tree; with an empty allocated set the
-    // sum in radius must be 0 → threshold not triggered.
+  it("returns triggered=false when no attribute is present in radius", () => {
     const r = evaluateThreshold(threshold, "7162", new Set<string>());
     expect(r.triggered).toBe(false);
     expect(r.attributeInRadius).toBe(0);
@@ -77,6 +78,30 @@ describe("evaluateThreshold (uses real PoB tree data)", () => {
   it("uses the override radius when provided", () => {
     const r = evaluateThreshold(threshold, "7162", new Set<string>(), 100);
     expect(r.radius).toBe(100);
+  });
+
+  it('counts unallocated attributes for legacy With-at-least thresholds', () => {
+    const tree = legacyJewelTree();
+    tree.nodes['40'].stats = ['+40 to Strength'];
+    jest.spyOn(loader, 'getPobTreeData').mockReturnValue(tree);
+    const result = evaluateThreshold(threshold, '7162', new Set());
+    expect(result.attributeInRadius).toBe(40);
+    expect(result.triggered).toBe(true);
+  });
+
+  it('uses base all-attribute and dual-attribute bonuses but not conditional or increased bonuses', () => {
+    const tree = legacyJewelTree();
+    tree.nodes['40'].stats = ['+10 to all Attributes', '+15 to Strength and Dexterity', '-5 to Strength', '20% increased Strength', '+99 to Strength while on Full Life'];
+    jest.spyOn(loader, 'getPobTreeData').mockReturnValue(tree);
+    expect(evaluateThreshold(threshold, '7162', new Set()).attributeInRadius).toBe(20);
+  });
+
+  it('reads a legacy item Radius header instead of assuming every threshold has Small radius', () => {
+    const tree = legacyJewelTree(); tree.nodes['6712'].stats = ['+40 to Strength'];
+    jest.spyOn(loader, 'getPobTreeData').mockReturnValue(tree);
+    const result = evaluateBuildThresholds([{ socketNodeId: '26196', jewelName: 'Divine Inferno', mods: ['Radius: Medium', 'With at least 40 Strength in Radius, Combust is Disabled'] }], new Set());
+    expect(result.evaluations[0].radius).toBe(1200);
+    expect(result.evaluations[0].triggered).toHaveLength(1);
   });
 });
 
@@ -95,7 +120,7 @@ describe("evaluateBuildThresholds (integration)", () => {
         },
         {
           socketNodeId: "7162",
-          jewelName: "Brawn",
+          jewelName: "Synthetic attribute-threshold jewel",
           mods: [
             "With at least 40 Strength in Radius, 1% increased Strength per 20 Strength",
             "Implicit: +5 to all Attributes",
@@ -115,8 +140,8 @@ describe("evaluateBuildThresholds (integration)", () => {
     expect(result.jewelsScanned).toBe(3);
     expect(result.jewelsWithThresholds).toBe(1);
     expect(result.evaluations).toHaveLength(1);
-    expect(result.evaluations[0].jewelName).toBe("Brawn");
-    // Empty allocated set → not triggered.
+    expect(result.evaluations[0].jewelName).toBe("Synthetic attribute-threshold jewel");
+    // No attribute nodes in this fixture's radius → not triggered.
     expect(result.evaluations[0].notTriggered).toHaveLength(1);
     expect(result.evaluations[0].triggered).toHaveLength(0);
   });

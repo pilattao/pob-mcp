@@ -3,6 +3,7 @@ import { createConnection, Socket } from "net";
 import { EventEmitter } from "events";
 import path from "path";
 import os from "os";
+import { XMLParser, XMLValidator } from "fast-xml-parser";
 
 /** Lua bridge request envelope */
 type LuaRequest = { action: string; params?: Record<string, unknown> };
@@ -839,65 +840,52 @@ export class PoBLuaTcpClient extends PoBApiBase {
     );
   }
 
-  /** Class metadata for minimal build XML generation. */
-  private static readonly CLASS_META: Record<string, { id: number; startNode: number; ascendancies: Record<string, number> }> = {
-    Scion:    { id: 0, startNode: 58833, ascendancies: { None: 0, Ascendant: 1 } },
-    Marauder: { id: 1, startNode: 58308, ascendancies: { None: 0, Juggernaut: 1, Berserker: 2, Chieftain: 3 } },
-    Ranger:   { id: 2, startNode: 16828, ascendancies: { None: 0, Raider: 1, Deadeye: 2, Pathfinder: 3 } },
-    Witch:    { id: 3, startNode: 2714,  ascendancies: { None: 0, Occultist: 1, Elementalist: 2, Necromancer: 3 } },
-    Duelist:  { id: 4, startNode: 56547, ascendancies: { None: 0, Slayer: 1, Gladiator: 2, Champion: 3 } },
-    Templar:  { id: 5, startNode: 4201,  ascendancies: { None: 0, Inquisitor: 1, Hierophant: 2, Guardian: 3 } },
-    Shadow:   { id: 6, startNode: 35631, ascendancies: { None: 0, Assassin: 1, Trickster: 2, Saboteur: 3 } },
-  };
+  private buildOpenInFlight = false;
 
-  private static makeBlankBuildXml(className = "Scion", ascendancy = "None"): string {
-    const meta = PoBLuaTcpClient.CLASS_META[className] ?? PoBLuaTcpClient.CLASS_META["Scion"]!;
-    const ascId = meta.ascendancies[ascendancy] ?? 0;
-    return `<?xml version="1.0" encoding="UTF-8"?>\n` +
-      `<PathOfBuilding>\n` +
-      `  <Build level="1" targetVersion="3_21" bandits="None" ` +
-        `className="${className}" ascendClassName="${ascendancy}" mainSocketGroup="1"/>\n` +
-      `  <Skills/>\n` +
-      `  <Tree activeSpec="1">\n` +
-      `    <Spec treeVersion="3_21" ascendClassId="${ascId}" classId="${meta.id}" ` +
-        `nodes="${meta.startNode}"/>\n` +
-      `  </Tree>\n` +
-      `  <Items/>\n` +
-      `  <Notes/>\n` +
-      `</PathOfBuilding>`;
-  }
-
-  /**
-   * In TCP mode, new_build lets PoB create a fresh default build via
-   * open_build_xml with no XML, then polls until calcsTab/importTab are ready.
-   */
-  override async newBuild(params?: { className?: string; ascendancy?: string }): Promise<any> {
-    // Pass no XML — PoB creates its own default new build.
-    const res = await this.send({ action: "open_build_xml", params: { path: "" } });
-    if (!res.ok) throw new Error(res.error || "open_build_xml failed");
-
-    // Poll get_build_info until the build is initialized (ready flag or non-empty info).
-    for (let i = 0; i < 20; i++) {
-      await new Promise(r => setTimeout(r, 150));
-      try {
-        const info = await this.getBuildInfo();
-        if (info) break;
-      } catch { /* not ready yet */ }
+  /** Wait for the exact native SetMode operation, never a previous build's info. */
+  private async openBuild(params: Record<string, unknown>): Promise<any> {
+    if (this.buildOpenInFlight) throw new Error("A build open is already pending on this client");
+    this.buildOpenInFlight = true;
+    try {
+      // Probe before mutating: older APIs discard class parameters and readiness data.
+      const capability = await this.send({ action: "version" });
+      const version = capability.version as { features?: { queuedBuildOpen?: boolean } } | undefined;
+      if (!capability.ok || version?.features?.queuedBuildOpen !== true) {
+        throw new Error("Native API lacks queued-build-open support; deploy API 1.2 before creating/loading builds");
+      }
+      const queued = await this.send({ action: "open_build_xml", params });
+      if (!queued.ok) throw new Error(queued.error || "open_build_xml failed");
+      if (typeof queued.requestId !== "string") throw new Error("Missing build open requestId in native API response");
+      const deadline = Date.now() + this.options.timeoutMs;
+      while (Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))));
+        const status = await this.send({ action: "get_build_open_status", params: { requestId: queued.requestId } });
+        if (!status.ok) throw new Error(status.error || "native build open failed");
+        if (status.requestId !== queued.requestId) throw new Error("Native build open response has a different requestId");
+        if (status.ready === true) return status;
+      }
+      throw new Error(`Timed out waiting for build open request ${queued.requestId}; native completion is unconfirmed`);
+    } finally {
+      this.buildOpenInFlight = false;
     }
-    return res;
   }
 
-  /**
-   * In TCP mode, load/create a build by calling open_build_xml which routes
-   * through PoB's main:SetMode('BUILD',...) so the GUI switches to the build.
-   * The base-class loadBuildXml sends 'load_build_xml' which TcpServer rejects.
-   */
+  override async newBuild(params?: { className?: string; ascendancy?: string }): Promise<any> {
+    // The running tree resolves class names and applies the nine-argument tree ABI.
+    return this.openBuild({ path: "", ...params });
+  }
+
   override async loadBuildXml(xml: string, name = "API Build", path = ""): Promise<any> {
-    const res = await this.send({ action: "open_build_xml", params: { xml, name, path } });
-    if (!res.ok) throw new Error(res.error || "open_build_xml failed");
-    // Brief wait for Build:Init to complete across frames before the next request.
-    await new Promise(r => setTimeout(r, 300));
-    return res;
+    if (typeof xml !== "string" || XMLValidator.validate(xml) !== true) {
+      throw new Error("Invalid build XML; public get_character_pob results contain XML in their pob_xml field");
+    }
+    const document = new XMLParser({ ignoreDeclaration: true }).parse(xml);
+    const root = process.env.POE_GAME === "poe2" ? "PathOfBuilding2" : "PathOfBuilding";
+    if (!document || Object.keys(document).length !== 1 || !(root in document)) {
+      throw new Error(`Invalid build XML: expected ${root} root; pass the pob_xml field, not a JSON result envelope`);
+    }
+    // Validation does not rewrite any XML section, selected set, override or extension.
+    return this.openBuild({ xml, name, path });
   }
 
   /** Disconnect without sending 'quit' — PoB GUI keeps running. */

@@ -1,5 +1,9 @@
 import type { AnyLuaClient } from "../pobLuaBridge.js";
-import type { BuildIssue } from "../types.js";
+import type { BuildIssue, PoBBuild, ValidationIssue } from "../types.js";
+import { BuildService } from "../services/buildService.js";
+import { ValidationService } from "../services/validationService.js";
+import { activeValidationSpec, poe2PassiveBudget, validationStat } from "../services/passiveBudget.js";
+import { getPobTreeData } from "../services/pobTreeDataLoader.js";
 import { wrapHandler } from "../utils/errorHandling.js";
 
 export interface BuildGoalsHandlerContext {
@@ -20,9 +24,13 @@ const ISSUES_FIELDS = [
 
 export async function handleGetBuildIssues(context: BuildGoalsHandlerContext) {
   return wrapHandler('get build issues', async () => {
+    const game = (process.env.POE_GAME ?? 'poe2').trim().toLowerCase();
+    if (game !== 'poe2' && game !== 'poe1') throw new Error('POE_GAME must be poe2 or poe1');
     await context.ensureLuaClient();
     const luaClient = context.getLuaClient();
     if (!luaClient) throw new Error('Lua bridge not active. Use lua_start and lua_load_build first.');
+
+    if (game === 'poe2') return getPoe2BuildIssues(luaClient);
 
     const stats = await luaClient.getStats(ISSUES_FIELDS);
     const issues: BuildIssue[] = [];
@@ -198,6 +206,106 @@ export async function handleGetBuildIssues(context: BuildGoalsHandlerContext) {
   });
 }
 
+// Keep the quick scan on selected native outputs. Missing fields stay absent;
+// saved PlayerStats must not fill holes in a partial live response.
+const POE2_ISSUE_FIELDS = [
+  'Life', 'LifeUnreserved', 'EnergyShield', 'Mana', 'ManaUnreserved', 'Spirit', 'SpiritUnreserved', 'Ward',
+  'LifeCost', 'ManaCost', 'NetManaRegen', 'Str', 'Dex', 'Int', 'ReqStr', 'ReqDex', 'ReqInt', 'HitChance',
+  'FireResist', 'ColdResist', 'LightningResist', 'ChaosResist',
+  'MissingFireResist', 'MissingColdResist', 'MissingLightningResist', 'MissingChaosResist',
+  'TotalDPS', 'CombinedDPS', 'MinionTotalDPS', 'TotalEHP', 'ExtraPoints', 'PassivePointsToWeaponSetPoints',
+  'PhysicalMaximumHitTaken', 'FireMaximumHitTaken', 'ColdMaximumHitTaken', 'LightningMaximumHitTaken', 'ChaosMaximumHitTaken',
+  'EvadeChance', 'DeflectChance', 'EffectiveBlockChance', 'Armour', 'PhysicalDamageReduction',
+  'LifeRegenRecovery', 'LifeLeechGainRate', 'EnergyShieldRegenRecovery', 'EnergyShieldLeechGainRate',
+  'EnergyShieldRecharge', 'ManaRegenRecovery', 'FreezeAvoidChance', 'BleedAvoidChance', 'PoisonAvoidChance',
+];
+
+function addPassiveEvidence(build: PoBBuild | undefined, stats: Record<string, number>, issues: BuildIssue[]) {
+  try {
+    if (!build?.Tree) throw new Error('exported tree is unavailable');
+    const specs = build.Tree.Spec;
+    if (Array.isArray(specs)) {
+      const selected = Number(build.Tree.activeSpec ?? 1);
+      if (!Number.isInteger(selected) || !specs[selected - 1]) throw new Error('selected tree spec is unavailable');
+    }
+    const spec = activeValidationSpec(build);
+    if (!spec || !String(spec.treeVersion ?? '').startsWith('0_') || typeof spec.nodes !== 'string') {
+      throw new Error('selected native PoE2 spec or allocation list is unavailable');
+    }
+    const ids = [...new Set<string>(spec.nodes.split(',').map((id: string) => id.trim()).filter(Boolean))];
+    const tree = ids.length ? getPobTreeData(spec.treeVersion) : null;
+    if (ids.some(id => !tree?.nodes[id])) throw new Error('allocated node definitions are missing from the installed tree');
+    const budget = poe2PassiveBudget(build, ids.map(id => tree!.nodes[id]), stats);
+    const available = budget.availablePoints ?? 'unknown';
+    issues.push({ severity: 'info', category: 'defence', message:
+      `PoE2 passive spending: weapon set 1 ${budget.perWeaponPoints[0]} / ${available}; weapon set 2 ${budget.perWeaponPoints[1]} / ${available}. ` +
+      `Shared ${budget.sharedPoints}; weapon-specific ${budget.weaponSetPoints.join(' / ')}. ${budget.notes.join(' ')}` });
+    for (const message of budget.warnings) issues.push({ severity: 'warning', category: 'defence', message });
+  } catch (error) {
+    issues.push({ severity: 'info', category: 'defence', message: `Unknown data: passive budget unknown (${error instanceof Error ? error.message : 'native data unavailable'}).` });
+  }
+}
+
+async function getPoe2BuildIssues(luaClient: AnyLuaClient) {
+  const issues: BuildIssue[] = [];
+  let build: PoBBuild | undefined;
+  try {
+    // Parsing an in-memory export performs no build load, save or gear changes.
+    build = new BuildService('').parseBuildContent(await luaClient.exportBuildXml());
+  } catch {
+    issues.push({ severity: 'info', category: 'items', message: 'Unknown data: live build XML unavailable; selected equipment, skill setup and tree allocation are unknown.' });
+  }
+  if (build && build.__xmlRoot !== 'PathOfBuilding2') {
+    throw new Error('PoE2 quick scan received a PoE1 build export; native game selection must match.');
+  }
+  const stats: Record<string, number> = {};
+  try {
+    const native = await luaClient.getStats(POE2_ISSUE_FIELDS);
+    for (const key of POE2_ISSUE_FIELDS) {
+      const value = validationStat(native, key);
+      if (value !== null) stats[key] = value;
+    }
+  } catch {
+    issues.push({ severity: 'info', category: 'defence', message: 'Unknown data: selected native outputs are unknown because the stats read failed.' });
+  }
+  const required = ['Life', 'EnergyShield', 'Mana', 'Spirit', 'Ward',
+    'FireResist', 'ColdResist', 'LightningResist', 'ChaosResist',
+    'MissingFireResist', 'MissingColdResist', 'MissingLightningResist', 'MissingChaosResist',
+    'LifeUnreserved', 'ManaUnreserved', 'SpiritUnreserved', 'LifeCost', 'ManaCost',
+    'Str', 'Dex', 'Int', 'ReqStr', 'ReqDex', 'ReqInt'];
+  const missing = required.filter(key => validationStat(stats, key) === null);
+  if (missing.length) issues.push({ severity: 'info', category: 'defence', message: `Unknown data: native outputs unavailable for ${missing.join(', ')}.` });
+
+  // An absent XML contains no assumed items. ValidationService labels charm
+  // protection unknown, and receives only the live stats (never saved fallbacks).
+  const validation = new ValidationService().validateBuild(build ?? { __xmlRoot: 'PathOfBuilding2' }, null, stats);
+  const categories: Record<ValidationIssue['category'], BuildIssue['category']> = {
+    resistances: 'resistance', defenses: 'defence', immunities: 'items', mana: 'reservation', accuracy: 'gems', general: 'items',
+  };
+  for (const issue of [...validation.criticalIssues, ...validation.warnings, ...validation.recommendations]) {
+    issues.push({ severity: issue.severity === 'critical' ? 'error' : issue.severity,
+      category: categories[issue.category], message: issue.description });
+  }
+  addPassiveEvidence(build, stats, issues);
+  issues.push({ severity: 'info', category: 'defence', message: `Scan scope: ${validation.summary} Equipment completeness, socket usability and full damage coverage are not assessed by this quick scan.` });
+  return { issues, stats };
+}
+
+/** Shared by explicit scans and the automatic load summary. */
+export function formatQuickStats(stats: Record<string, unknown>): string[] {
+  const number = (key: string, suffix = '') => {
+    const value = validationStat(stats, key);
+    return value === null ? 'unknown' : value.toLocaleString('en-US', { maximumFractionDigits: 2 }) + suffix;
+  };
+  const dpsKey = validationStat(stats, 'CombinedDPS') !== null ? 'CombinedDPS' : 'TotalDPS';
+  return [
+    `Life: ${number('Life')} | ES: ${number('EnergyShield')} | Mana: ${number('Mana')} | Spirit: ${number('Spirit')} | Ward: ${number('Ward')}`,
+    `Unreserved — Life: ${number('LifeUnreserved')} | Mana: ${number('ManaUnreserved')} | Spirit: ${number('SpiritUnreserved')}`,
+    `Selected-skill DPS: ${number(dpsKey)} | Minion DPS: ${number('MinionTotalDPS')} | EHP: ${number('TotalEHP')}`,
+    `Fire: ${number('FireResist', '%')} | Cold: ${number('ColdResist', '%')} | Lightning: ${number('LightningResist', '%')} | Chaos: ${number('ChaosResist', '%')}`,
+  ];
+}
+
 export function formatIssuesResponse(issues: BuildIssue[], stats: Record<string, any>) {
   const errors = issues.filter(i => i.severity === 'error');
   const warnings = issues.filter(i => i.severity === 'warning');
@@ -206,7 +314,7 @@ export function formatIssuesResponse(issues: BuildIssue[], stats: Record<string,
   let text = '=== Build Issues ===\n\n';
 
   if (issues.length === 0) {
-    text += '✅ No issues found. Build looks healthy!\n';
+    text += 'No issues established by this scan. Overall build viability remains unknown.\n';
   } else {
     if (errors.length > 0) {
       text += `**Errors (${errors.length}):**\n`;
@@ -231,12 +339,7 @@ export function formatIssuesResponse(issues: BuildIssue[], stats: Record<string,
     }
   }
 
-  text += '=== Current Stats ===\n';
-  text += `Life: ${stats.Life ?? 'N/A'}  |  ES: ${stats.EnergyShield ?? 'N/A'}  |  Mana: ${stats.Mana ?? 'N/A'}\n`;
-  text += `Fire: ${stats.FireResist ?? 0}%  |  Cold: ${stats.ColdResist ?? 0}%  |  Lightning: ${stats.LightningResist ?? 0}%  |  Chaos: ${stats.ChaosResist ?? 0}%\n`;
-  const dps = stats.CombinedDPS ?? stats.TotalDPS ?? 0;
-  const minionDps = stats.MinionTotalDPS ?? 0;
-  text += `DPS: ${Number(dps).toLocaleString()}${minionDps > 0 ? `  |  Minion DPS: ${Number(minionDps).toLocaleString()}` : ''}\n`;
+  text += '=== Current Stats ===\n' + formatQuickStats(stats).join('\n') + '\n';
 
   return {
     content: [{ type: 'text' as const, text }],

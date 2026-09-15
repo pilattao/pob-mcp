@@ -1,21 +1,17 @@
-import { describe, it, expect } from '@jest/globals';
-import { existsSync } from 'fs';
-import { resolve } from 'path';
+import { useLegacyCraftFixture } from '../fixtures/coreCraftLegacy';
+let legacy: ReturnType<typeof useLegacyCraftFixture>;
+beforeAll(() => { legacy = useLegacyCraftFixture(); });
+afterAll(() => legacy.cleanup());
+import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 
 import { handleListCraftableModsForBase } from '../../src/handlers/listCraftableModsHandler';
 
-const pobDir = process.env.POB_DIRECTORY ?? resolve(process.cwd(), '..', 'PathOfBuilding');
-const hasAll =
-  (existsSync(resolve(pobDir, 'src', 'Data', 'ModExplicit.lua')) || existsSync(resolve(pobDir, 'src', 'Data', 'ModItem.lua'))) &&
-  existsSync(resolve(pobDir, 'src', 'Data', 'Bases', 'body.lua'));
-
-const describeIfPob = hasAll ? describe : describe.skip;
 
 function getText(result: { content: Array<{ type: string; text: string }> }): string {
   return result.content.map((c) => c.text).join('\n');
 }
 
-describeIfPob('handleListCraftableModsForBase', () => {
+describe('handleListCraftableModsForBase', () => {
   it('rejects missing base_name', async () => {
     // Cast through unknown to bypass TS — the handler must guard at runtime.
     const r = await handleListCraftableModsForBase({ base_name: '' as unknown as string });

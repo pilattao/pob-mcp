@@ -1,21 +1,17 @@
-import { describe, it, expect } from '@jest/globals';
-import { existsSync } from 'fs';
-import { resolve } from 'path';
+import { useLegacyCraftFixture } from '../fixtures/coreCraftLegacy';
+let legacy: ReturnType<typeof useLegacyCraftFixture>;
+beforeAll(() => { legacy = useLegacyCraftFixture(); });
+afterAll(() => legacy.cleanup());
+import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 
 import { handleAnalyzeItemMods } from '../../src/handlers/analyzeItemModsHandler';
 
-const pobDir = process.env.POB_DIRECTORY ?? resolve(process.cwd(), '..', 'PathOfBuilding');
-const hasAll =
-  (existsSync(resolve(pobDir, 'src', 'Data', 'ModExplicit.lua')) || existsSync(resolve(pobDir, 'src', 'Data', 'ModItem.lua'))) &&
-  existsSync(resolve(pobDir, 'src', 'Data', 'Bases', 'body.lua'));
-
-const describeIfPob = hasAll ? describe : describe.skip;
 
 function getText(result: { content: Array<{ type: string; text: string }> }): string {
   return result.content.map((c) => c.text).join('\n');
 }
 
-describeIfPob('handleAnalyzeItemMods', () => {
+describe('handleAnalyzeItemMods', () => {
   it('rejects empty mod_lines', async () => {
     const r = await handleAnalyzeItemMods({ mod_lines: [] });
     expect(r.isError).toBe(true);
@@ -73,13 +69,8 @@ describeIfPob('handleAnalyzeItemMods', () => {
       raw_json: true,
     });
     const parsed = JSON.parse(getText(r));
-    // If both lines matched the same hybrid mod, the second is flagged
-    const ids = parsed.lines.map((l: { match: { best?: { id: string } } | null }) => l.match?.best?.id);
-    if (ids[0] && ids[0] === ids[1]) {
-      expect(parsed.lines[1].is_hybrid_continuation).toBe(true);
-    }
-    // (If they matched different mods, no continuation — still valid; the
-    // test only asserts the collapse logic when IDs coincide.)
+    expect(parsed.lines[1].is_hybrid_continuation).toBe(true);
+    expect(parsed.lines[1].match.best.id).toBe('ArmourLife');
     expect(parsed.lines.length).toBe(2);
   });
 

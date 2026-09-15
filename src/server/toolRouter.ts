@@ -450,7 +450,9 @@ export async function routeToolCall(
         base_name: args.base_name as string,
         ilvl: args.ilvl as number,
         targets: args.targets as Array<{ stat?: string; group?: string; min_tier?: number }>,
-        method: args.method as "chaos" | "alt" | "essence" | undefined,
+        method: args.method as "chaos" | "alt" | "essence" | "exalt" | "augment" | "regal" | undefined,
+        item_rarity: args.item_rarity as "magic" | "rare" | undefined,
+        existing_mod_ids: args.existing_mod_ids as string[] | undefined,
         essence_name: args.essence_name as string | undefined,
         prefix_count: args.prefix_count as number | undefined,
         suffix_count: args.suffix_count as number | undefined,
@@ -491,7 +493,7 @@ export async function routeToolCall(
       );
 
     case "lua_import_character":
-      if (!args?.character_name) throw new Error("Missing character_name");
+      if (!args || (process.env.POE_GAME !== 'poe2' && !args.character_name)) throw new Error("Missing character_name");
       return await handleImportCharacter(
         luaContext,
         args.account_name as string | undefined,
@@ -503,6 +505,7 @@ export async function routeToolCall(
           clearSkills: args.clear_skills as boolean | undefined,
           ignoreWeaponSwap: args.ignore_weapon_swap as boolean | undefined,
           bandit: args.bandit as string | undefined,
+          pobXml: args.pob_xml as string | undefined,
         }
       );
 
@@ -514,7 +517,11 @@ export async function routeToolCall(
       return await handleSharePobb(luaContext, args?.platform as string | undefined ?? "pobb.in");
 
     case "get_context_usage":
-      return await handleGetContextUsage();
+      return await handleGetContextUsage({
+        client: args?.client as 'codex' | 'claude' | undefined,
+        transcript_path: args?.transcript_path as string | undefined,
+        thread_id: args?.thread_id as string | undefined,
+      });
 
     case "minion_dps_breakdown":
       return await handleMinionDpsBreakdown(luaContext);
@@ -643,6 +650,7 @@ export async function routeToolCall(
       return await handleSetConfig(setConfigContext, {
         config_name: args.config_name as string,
         value: args.value as boolean | number | string,
+        config: args.config as Record<string, unknown> | undefined,
       });
 
     case "set_pob_view":
