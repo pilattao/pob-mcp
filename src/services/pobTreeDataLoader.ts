@@ -172,19 +172,40 @@ function luaToJs(node: LuaNode | null | undefined): unknown {
 
 function asArray(v: unknown): unknown[] {
   if (Array.isArray(v)) return v;
-  if (v && typeof v === "object" && Object.keys(v as object).length === 0) return [];
+  if (v && typeof v === "object") {
+    const entries = Object.entries(v);
+    if (!entries.length) return [];
+    if (entries.every(([key]) => /^\d+$/.test(key))) {
+      return entries.sort(([a], [b]) => Number(a) - Number(b)).map(([, value]) => value);
+    }
+  }
   return v ? [v] : [];
 }
 
 function normalizeNode(raw: Record<string, unknown>): PobNode {
   const out: PobNode = { ...(raw as PobNode) };
   out.stats = asArray(raw.stats) as string[];
-  out.in = asArray(raw.in) as string[];
-  out.out = asArray(raw.out) as string[];
+  const connections = asArray(raw.connections).map(c => typeof c === 'object' && c !== null ? String((c as { id: unknown }).id) : String(c));
+  out.in = raw.in === undefined ? connections : asArray(raw.in).map(String);
+  out.out = raw.out === undefined ? connections : asArray(raw.out).map(String);
   if (raw.recipe) out.recipe = asArray(raw.recipe) as string[];
   if (raw.flavourText) out.flavourText = asArray(raw.flavourText) as string[];
   if (raw.reminderText) out.reminderText = asArray(raw.reminderText) as string[];
   return out;
+}
+
+function normalizeNodes(rawNodes: Record<string, Record<string, unknown>>): Record<string, PobNode> {
+  const nodes = Object.fromEntries(Object.entries(rawNodes).map(([id, node]) => [id, normalizeNode(node)]));
+  // PoB2 emits a connection on one endpoint only. The passive graph is undirected.
+  for (const [id, raw] of Object.entries(rawNodes)) {
+    if (raw.connections === undefined) continue;
+    for (const adjacent of nodes[id].out) {
+      if (!nodes[adjacent]) continue;
+      nodes[adjacent].in = [...new Set([...nodes[adjacent].in, id])];
+      nodes[adjacent].out = [...new Set([...nodes[adjacent].out, id])];
+    }
+  }
+  return nodes;
 }
 
 // ---------------------------------------------------------------------------
@@ -243,8 +264,14 @@ function resolveSuiteRoot(): string {
  * the submodule isn't at the canonical `<suite>/PathOfBuilding/` location.
  */
 function resolvePobDir(): string {
+  if (process.env.POB_INSTALL_DIR) return process.env.POB_INSTALL_DIR;
   if (process.env.POE_MCP_SUITE_POB_DIR) return process.env.POE_MCP_SUITE_POB_DIR;
   return join(resolveSuiteRoot(), "PathOfBuilding");
+}
+
+function resolveTreeDataDir(pobDir: string): string {
+  const installed = join(pobDir, 'TreeData');
+  return existsSync(installed) ? installed : join(pobDir, 'src', 'TreeData');
 }
 
 /**
@@ -252,12 +279,13 @@ function resolvePobDir(): string {
  * Versions are named like `3_28`, `3_27`, etc. We pick the lexically largest.
  */
 function findLatestVersion(pobDir: string): string {
-  const treeDataDir = join(pobDir, "src", "TreeData");
+  const treeDataDir = resolveTreeDataDir(pobDir);
   const entries = readdirSync(treeDataDir, { withFileTypes: true });
   const versions = entries
     .filter((e) => e.isDirectory())
     .map((e) => e.name)
     .filter((n) => /^\d+_\d+$/.test(n))
+    .filter((n) => process.env.POE_GAME !== 'poe2' || n.startsWith('0_'))
     .sort((a, b) => {
       const [aMaj, aMin] = a.split("_").map(Number);
       const [bMaj, bMin] = b.split("_").map(Number);
@@ -273,7 +301,10 @@ function findLatestVersion(pobDir: string): string {
 function treeLuaPath(version?: string): { path: string; version: string } {
   const pobDir = resolvePobDir();
   const ver = version ?? findLatestVersion(pobDir);
-  return { path: join(pobDir, "src", "TreeData", ver, "tree.lua"), version: ver };
+  if (process.env.POE_GAME === 'poe2' && !/^0_\d+$/.test(ver)) {
+    throw new Error(`Tree version ${ver} does not belong to PoE2`);
+  }
+  return { path: join(resolveTreeDataDir(pobDir), ver, "tree.lua"), version: ver };
 }
 
 // Tracks which source the cached tree came from, for the version most
@@ -283,7 +314,7 @@ let loadedSource: TreeDataSource = "pob-tree-lua";
 function loadFromPobTreeLua(version?: string): { data: PobTreeData; resolvedVersion: string } {
   const { path, version: resolvedVersion } = treeLuaPath(version);
   const stat = statSync(path);
-  const cached = treeCache.get(resolvedVersion);
+  const cached = treeCache.get(path);
   if (cached && cached.mtimeMs === stat.mtimeMs) {
     return { data: cached.data, resolvedVersion };
   }
@@ -305,19 +336,18 @@ function loadFromPobTreeLua(version?: string): { data: PobTreeData; resolvedVers
     throw new Error(`Failed to parse ${path}: top-level is not an object`);
   }
 
-  const nodes: Record<string, PobNode> = {};
   const rawNodes = (parsed.nodes ?? {}) as Record<string, Record<string, unknown>>;
-  for (const [id, node] of Object.entries(rawNodes)) {
-    nodes[id] = normalizeNode(node);
-  }
+  const nodes = normalizeNodes(rawNodes);
 
   const data: PobTreeData = {
     ...(parsed as PobTreeData),
     nodes,
-    groups: (parsed.groups ?? {}) as Record<string, PobGroup>,
+    groups: Object.fromEntries(Object.entries((parsed.groups ?? {}) as Record<string, Record<string, unknown>>).map(([id, group]) => [id, {
+      ...group, nodes: asArray(group.nodes).map(String), orbits: asArray(group.orbits).map(Number),
+    }])) as Record<string, PobGroup>,
   };
 
-  treeCache.set(resolvedVersion, { mtimeMs: stat.mtimeMs, data });
+  treeCache.set(path, { mtimeMs: stat.mtimeMs, data });
   return { data, resolvedVersion };
 }
 
@@ -368,6 +398,10 @@ export function getPobTreeData(version?: string): PobTreeData {
     loadedSource = "pob-tree-lua";
     return data;
   } catch (pobErr) {
+    if (process.env.POE_GAME === 'poe2') {
+      const message = pobErr instanceof Error ? pobErr.message : String(pobErr);
+      throw new Error(`PoE2 tree data unavailable: ${message}. Configure POB_INSTALL_DIR with a PoB2 install; PoE1 fallback is disabled.`);
+    }
     try {
       const { data } = loadFromGggDataJson();
       loadedSource = "ggg-data-json";

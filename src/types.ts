@@ -33,6 +33,9 @@ export interface TreeDataCache {
 
 // Path of Building build interface
 export interface PoBBuild {
+  /** Internal document provenance, never serialized as a game field. */
+  __xmlRoot?: 'PathOfBuilding' | 'PathOfBuilding2';
+  __xmlElements?: string[];
   Build?: {
     level?: string;
     className?: string;

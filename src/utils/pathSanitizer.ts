@@ -10,7 +10,7 @@ export function sanitizeBuildName(name: string, baseDir: string): string {
     throw new Error('Build name contains null bytes');
   }
 
-  if (path.isAbsolute(name)) {
+  if (!name.trim() || path.isAbsolute(name) || path.win32.isAbsolute(name) || /^[a-z]:/i.test(name)) {
     throw new Error('Build name must be relative');
   }
 
@@ -20,7 +20,7 @@ export function sanitizeBuildName(name: string, baseDir: string): string {
     throw new Error('Build name contains path traversal');
   }
 
-  const resolved = path.resolve(baseDir, name);
+  const resolved = path.resolve(baseDir, normalized);
   const resolvedBase = path.resolve(baseDir);
 
   if (!resolved.startsWith(resolvedBase + path.sep) && resolved !== resolvedBase) {
@@ -28,4 +28,11 @@ export function sanitizeBuildName(name: string, baseDir: string): string {
   }
 
   return resolved;
+}
+
+/** Resolve build files consistently, while the generic sanitizer still handles JSON and directories. */
+export function resolveBuildPath(name: string, baseDir: string): string {
+  sanitizeBuildName(name, baseDir);
+  const filename = /\.xml$/i.test(name) ? name : `${name}.xml`;
+  return sanitizeBuildName(filename, baseDir);
 }

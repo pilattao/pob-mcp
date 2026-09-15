@@ -2,7 +2,8 @@ import { XMLParser } from "fast-xml-parser";
 import fs from "fs/promises";
 import path from "path";
 import type { PoBBuild, CachedBuild, ParsedConfiguration, ConfigInput, ConfigSet, Flask, FlaskAnalysis, Jewel, JewelAnalysis } from "../types.js";
-import { sanitizeBuildName } from "../utils/pathSanitizer.js";
+import { resolveBuildPath } from "../utils/pathSanitizer.js";
+import { unwrapBuildXml } from "../utils/buildXml.js";
 
 const CACHE_TTL_MS = 60_000;  // 60 seconds
 const CACHE_MAX_SIZE = 20;
@@ -40,7 +41,7 @@ export class BuildService {
           if (entry.isDirectory()) {
             // Recursively search subdirectories
             await findXmlFiles(fullPath, relPath);
-          } else if (entry.isFile() && entry.name.endsWith('.xml')) {
+          } else if (entry.isFile() && /\.xml$/i.test(entry.name)) {
             builds.push(relPath);
           }
         }
@@ -55,17 +56,17 @@ export class BuildService {
   }
 
   async readBuild(buildName: string): Promise<PoBBuild> {
-    // Check cache — evict if stale
-    const cached = this.buildCache.get(buildName);
+    const buildPath = resolveBuildPath(buildName, this.pobDirectory);
+    // Canonical paths keep alias reads and invalidation consistent.
+    const cached = this.buildCache.get(buildPath);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
       return cached.data;
     }
 
     // Cache miss or expired — read from file
-    const buildPath = sanitizeBuildName(buildName, this.pobDirectory);
     const content = await fs.readFile(buildPath, "utf-8");
     const parsed = this.parser.parse(content);
-    const buildData = parsed.PathOfBuilding;
+    const buildData = unwrapBuildXml(parsed, content);
 
     // Evict oldest entry if at capacity
     if (this.buildCache.size >= CACHE_MAX_SIZE) {
@@ -74,7 +75,7 @@ export class BuildService {
       if (oldest) this.buildCache.delete(oldest[0]);
     }
 
-    this.buildCache.set(buildName, { data: buildData, timestamp: Date.now() });
+    this.buildCache.set(buildPath, { data: buildData, timestamp: Date.now() });
     return buildData;
   }
 
@@ -230,7 +231,7 @@ export class BuildService {
   }
 
   invalidateBuild(buildName: string): void {
-    this.buildCache.delete(buildName);
+    this.buildCache.delete(resolveBuildPath(buildName, this.pobDirectory));
   }
 
   /**
