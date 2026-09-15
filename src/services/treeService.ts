@@ -4,22 +4,38 @@ import type {
   PassiveTreeData,
   TreeDataCache,
   PoBBuild,
-  TreeAnalysisResult,
   PathOptimization,
   EfficiencyScore,
   OptimizationSuggestion,
 } from "../types.js";
 import { BuildService } from "./buildService.js";
+import { getPobTreeData, getLoadedVersion } from './pobTreeDataLoader.js';
+import { isPoe2Validation, poe2PassiveBudget, type BudgetTreeAnalysis } from './passiveBudget.js';
 
 export class TreeService {
   private treeDataCache: Map<string, TreeDataCache> = new Map();
   private buildService: BuildService;
+  private nativeTreeCache = new WeakMap<object, PassiveTreeData>();
 
   constructor(buildService: BuildService) {
     this.buildService = buildService;
   }
 
-  async getTreeData(version: string = "3_26"): Promise<PassiveTreeData> {
+  async getTreeData(version?: string): Promise<PassiveTreeData> {
+    version = version ?? (process.env.POE_GAME === 'poe2' ? getLoadedVersion() : '3_26');
+    if (version.startsWith('0_') || process.env.POE_GAME === 'poe2') {
+      if (!version.startsWith('0_')) throw new Error(`Tree ${version} does not belong to PoE2`);
+      const native = getPobTreeData(version);
+      const cached = this.nativeTreeCache.get(native);
+      if (cached) return cached;
+      const result: PassiveTreeData = {
+        version, nodes: new Map(Object.entries(native.nodes)),
+        classes: Array.isArray(native.classes) ? native.classes : Object.values(native.classes ?? {}),
+        groups: Object.values(native.groups),
+      };
+      this.nativeTreeCache.set(native, result);
+      return result;
+    }
     // Check cache first
     const cached = this.treeDataCache.get(version);
     if (cached) {
@@ -264,6 +280,9 @@ export class TreeService {
     total: number;
     available: number;
   } {
+    if (isPoe2Validation(build)) {
+      throw new Error('PoE2 point budgets require node and weapon-set details; use analyzePassiveTree.');
+    }
     const level = parseInt(build.Build?.level || "1");
 
     // Base points: 1 per level starting at level 2
@@ -727,10 +746,12 @@ export class TreeService {
     return context;
   }
 
-  async analyzePassiveTree(build: PoBBuild): Promise<TreeAnalysisResult | null> {
+  async analyzePassiveTree(build: PoBBuild, nativeStats?: any): Promise<BudgetTreeAnalysis | null> {
     try {
       // Extract allocated node IDs
-      const nodeIds = this.buildService.parseAllocatedNodes(build);
+      const poe2 = isPoe2Validation(build);
+      const parsedIds = this.buildService.parseAllocatedNodes(build);
+      const nodeIds = poe2 ? [...new Set(parsedIds)] : parsedIds;
       if (nodeIds.length === 0) {
         return null; // No tree data in build
       }
@@ -738,6 +759,7 @@ export class TreeService {
       // Determine tree version from build
       let treeVersion = this.buildService.extractBuildVersion(build);
       if (treeVersion === "Unknown") {
+        if (poe2) throw new Error('PoE2 passive budget unknown: tree version is unavailable.');
         treeVersion = "3_26";
       }
 
@@ -774,7 +796,14 @@ export class TreeService {
 
       // Calculate points (exclude ascendancy nodes - they use separate point pool)
       const nonAscendancyNodes = allocatedNodes.filter(node => !node.ascendancyName);
-      const points = this.calculatePassivePoints(build, nonAscendancyNodes.length);
+      const savedStats = new Map((Array.isArray(build.Build?.PlayerStat) ? build.Build.PlayerStat : build.Build?.PlayerStat ? [build.Build.PlayerStat] : []).map(s => [s.stat, s.value]));
+      const passiveBudget = poe2 ? poe2PassiveBudget(build, allocatedNodes, nativeStats ?? savedStats) : undefined;
+      if (passiveBudget && (passiveBudget.availablePoints === null || allocatedNodes.length !== nodeIds.length)) {
+        throw new Error('PoE2 passive budget unknown: unverified version/level or dynamically allocated nodes require native accounting.');
+      }
+      const points = passiveBudget
+        ? { total: Math.max(...passiveBudget.perWeaponPoints), available: passiveBudget.availablePoints! }
+        : this.calculatePassivePoints(build, nonAscendancyNodes.length);
 
       // Detect archetype
       const { archetype, confidence } = this.detectArchetype(keystones, notables);
@@ -824,6 +853,7 @@ export class TreeService {
       }
 
       return {
+        ...(passiveBudget ? { passiveBudget } : {}),
         totalPoints: points.total,
         availablePoints: points.available,
         allocatedNodes,

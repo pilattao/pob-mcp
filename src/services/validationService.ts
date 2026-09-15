@@ -1,4 +1,7 @@
 import type { PoBBuild, BuildValidation, ValidationIssue, FlaskAnalysis } from "../types.js";
+import { isPoe2Validation, validationStat } from './passiveBudget.js';
+
+type ScopedValidation = Omit<BuildValidation, 'overallScore'> & { game?: 'poe2'; overallScore: number | null };
 
 export class ValidationService {
   /**
@@ -12,7 +15,8 @@ export class ValidationService {
     build: PoBBuild,
     flaskAnalysis: FlaskAnalysis | null = null,
     luaStats?: any
-  ): BuildValidation {
+  ): ScopedValidation {
+    if (isPoe2Validation(build)) return this.validatePoe2(build, luaStats ?? this.extractStats(build));
     const criticalIssues: ValidationIssue[] = [];
     const warnings: ValidationIssue[] = [];
     const recommendations: ValidationIssue[] = [];
@@ -46,6 +50,123 @@ export class ValidationService {
     };
   }
 
+  /** PoE2 checks use selected-skill outputs and equipped items, not PoE1 thresholds. */
+  private validatePoe2(build: PoBBuild, stats: any): ScopedValidation {
+    const criticalIssues: ValidationIssue[] = [];
+    const warnings: ValidationIssue[] = [];
+    const recommendations: ValidationIssue[] = [];
+    const get = (key: string) => validationStat(stats, key);
+    const add = (severity: ValidationIssue['severity'], category: ValidationIssue['category'], title: string,
+      description: string, suggestions: string[] = [], values: Partial<ValidationIssue> = {}) => {
+      const issues = severity === 'critical' ? criticalIssues : severity === 'warning' ? warnings : recommendations;
+      issues.push({ severity, category, title, description, suggestions, ...values });
+    };
+
+    // CalcDefence emits Missing<Element>Resist relative to the actual configured cap.
+    for (const element of ['Fire', 'Cold', 'Lightning', 'Chaos']) {
+      const value = get(`${element}Resist`);
+      const missing = get(`Missing${element}Resist`);
+      if (value === null) continue;
+      if (missing !== null && missing > 0) {
+        add(element === 'Chaos' ? 'warning' : 'critical', 'resistances', `${element} Resistance Below Configured Cap`,
+          `${element} resistance is ${value}%; native PoB2 reports ${missing}% missing from the configured cap.`,
+          [`Compare equipped gear and passive options that add ${element.toLowerCase()} resistance.`],
+          { currentValue: value, recommendedValue: value + missing });
+      } else if (element === 'Chaos' && value < 0) {
+        add('warning', 'resistances', 'Negative Chaos Resistance',
+          `Chaos resistance is ${value}%, increasing incoming chaos damage.`, ['Review chaos resistance on equipped gear.']);
+      } else if (element !== 'Chaos' && missing === null && value < 75) {
+        add('warning', 'resistances', `${element} Resistance Below Standard Reference`,
+          `${element} resistance is ${value}%, below the standard 75% reference. The actual configured cap is unknown.`,
+          ['Check the native resistance breakdown and equipped gear before choosing an upgrade.']);
+      }
+    }
+
+    for (const resource of ['Mana', 'Life']) {
+      const cost = get(`${resource}Cost`);
+      const pool = get(`${resource}Unreserved`);
+      if (cost !== null && pool !== null && cost > pool && cost > 0) {
+        add('critical', 'mana', `Selected Skill ${resource} Cost Exceeds Available Pool`,
+          `The selected skill costs ${cost} ${resource.toLowerCase()} per use with ${pool} unreserved in this configuration.`,
+          ['Review this skill and its supports, available resources, and native cost breakdown.'],
+          { currentValue: pool, recommendedValue: cost });
+      }
+    }
+    const spirit = get('SpiritUnreserved');
+    if (spirit !== null && spirit < 0) {
+      add('critical', 'mana', 'Spirit Overreserved', `Enabled skills reserve ${-spirit} more Spirit than available.`,
+        ['Review enabled persistent skills and their Spirit costs.']);
+    }
+    const netMana = get('NetManaRegen');
+    if (netMana !== null && netMana < 0) {
+      add('warning', 'mana', 'Configured Mana Recovery Deficit',
+        `Native net mana recovery is ${netMana}/s for the selected skill and configuration. Actual sustain depends on skill use and recovery uptime.`,
+        ['Inspect the native mana recovery and cost breakdown; compare recovery sources and skill costs.']);
+    }
+    for (const [key, name] of [['Str', 'Strength'], ['Dex', 'Dexterity'], ['Int', 'Intelligence']]) {
+      const have = get(key), required = get(`Req${key}`);
+      if (have !== null && required !== null && have < required) {
+        add('critical', 'general', `${name} Requirement Not Met`,
+          `Native requirements need ${required} ${name.toLowerCase()}; the build has ${have}.`,
+          ['Check the requirements of equipped items and enabled skills.'], { currentValue: have, recommendedValue: required });
+      }
+    }
+    const hitChance = get('HitChance');
+    if (hitChance !== null && hitChance >= 0 && hitChance < 100) {
+      add('info', 'accuracy', 'Selected Skill Hit Chance',
+        `Native hit chance is ${hitChance}% for the selected skill against the configured enemy.`,
+        ['For an accuracy-based attack, compare accuracy changes in the native calculation.']);
+    }
+
+    const defenseKeys = [
+      'Life', 'EnergyShield', 'ManaUnreserved', 'TotalEHP',
+      'PhysicalMaximumHitTaken', 'FireMaximumHitTaken', 'ColdMaximumHitTaken', 'LightningMaximumHitTaken', 'ChaosMaximumHitTaken',
+      'EvadeChance', 'DeflectChance', 'EffectiveBlockChance', 'Armour', 'PhysicalDamageReduction',
+      'LifeRegenRecovery', 'LifeLeechGainRate', 'EnergyShieldRegenRecovery', 'EnergyShieldLeechGainRate', 'EnergyShieldRecharge', 'ManaRegenRecovery',
+    ];
+    const measured = defenseKeys.flatMap(key => get(key) === null ? [] : [`${key}: ${get(key)}`]);
+    add('info', 'defenses', 'Native Defense Evidence',
+      (measured.length ? measured.join('; ') + '. ' : 'Defense outputs are unavailable. ') +
+      'These values depend on the selected configuration, enemy hit and recovery conditions. They do not establish an endgame life target or permanent defensive uptime.',
+      ['Compare native maximum-hit and recovery breakdowns for the intended encounter.']);
+
+    this.validatePoe2CharmProtection(build, stats, recommendations);
+    return {
+      game: 'poe2', isValid: criticalIssues.length === 0, overallScore: null, criticalIssues, warnings, recommendations,
+      summary: `Limited PoE2 checks: ${criticalIssues.length} critical issue(s), ${warnings.length} warning(s) established from available outputs. Overall viability and unobserved defenses remain unknown.`,
+    };
+  }
+
+  private validatePoe2CharmProtection(build: PoBBuild, stats: any, recommendations: ValidationIssue[]): void {
+    const asArray = <T>(value: T | T[] | undefined): T[] => value === undefined ? [] : Array.isArray(value) ? value : [value];
+    const items = build.Items as any;
+    const sets = asArray<any>(items?.ItemSet);
+    // Unknown explicit selection must not borrow another set's protection.
+    const set = items?.activeItemSet !== undefined
+      ? sets.find(s => String(s.id) === String(items.activeItemSet))
+      : sets.length === 1 ? sets[0] : undefined;
+    const itemTexts = new Map(asArray<any>(items?.Item).map(i => [String(i.id), i['#text']]));
+    const charms = asArray<any>(set?.Slot).filter(s => /^Charm \d+$/.test(s.name ?? '')).flatMap(slot => {
+      const raw = slot.Item ?? itemTexts.get(String(slot.itemId));
+      if (typeof raw !== 'string') return [];
+      // Name/base lines only: mentioning freeze in an unrelated modifier isn't protection.
+      const nameLines = raw.trim().split(/\r?\n/).slice(1, 3).join('\n');
+      return [{ nameLines, active: slot.active === true || slot.active === 'true' }];
+    });
+    for (const [ailment, label, base] of [
+      ['Freeze', 'Freeze', 'Thawing Charm'], ['Bleed', 'Bleeding', 'Staunching Charm'], ['Poison', 'Poison', 'Antidote Charm'],
+    ]) {
+      const charm = charms.find(c => c.nameLines.includes(base));
+      const avoidance = validationStat(stats, `${ailment}AvoidChance`);
+      const evidence = charm
+        ? `${label} protection is conditional: equipped ${base} provides protection during its effect. Activation depends on its trigger, charges and duration; ${charm.active ? 'enabled in PoB' : 'not enabled in PoB'}. Permanent immunity is not established.`
+        : `${label} protection is unknown: no matching protective charm was identified in the selected item set; other sources have not been established.`;
+      recommendations.push({ severity: 'info', category: 'immunities', title: `${label} Protection Evidence`,
+        description: evidence + (avoidance === null ? '' : ` Native ${ailment}AvoidChance is ${avoidance}% in this configuration; its conditions still apply.`),
+        suggestions: ['Check native ailment avoidance, equipped item effects, and charm uptime for the encounter.'], location: 'Charms & Defenses' });
+    }
+  }
+
   private extractStats(build: PoBBuild): Map<string, number> {
     const stats = new Map<string, number>();
 
@@ -58,8 +179,8 @@ export class ValidationService {
       : [build.Build.PlayerStat];
 
     for (const stat of statArray) {
-      const value = parseFloat(stat.value);
-      if (!isNaN(value)) {
+      const value = validationStat(stat, 'value');
+      if (value !== null) {
         stats.set(stat.stat, value);
       }
     }
@@ -611,10 +732,11 @@ export class ValidationService {
   /**
    * Format validation results for display
    */
-  formatValidation(validation: BuildValidation): string {
+  formatValidation(validation: ScopedValidation): string {
     let output = '=== Build Validation Report ===\n\n';
 
-    output += `Overall Score: ${validation.overallScore.toFixed(1)}/10\n`;
+    const poe2 = validation.game === 'poe2';
+    output += poe2 ? 'Overall viability: unknown (limited native checks)\n' : `Overall Score: ${validation.overallScore?.toFixed(1) ?? 'unknown'}/10\n`;
     output += `Status: ${validation.summary}\n\n`;
 
     // Critical Issues
@@ -644,7 +766,7 @@ export class ValidationService {
       output += '\n';
     }
 
-    if (validation.isValid && validation.warnings.length === 0 && validation.recommendations.length === 0) {
+    if (!poe2 && validation.isValid && validation.warnings.length === 0 && validation.recommendations.length === 0) {
       output += '✅ No issues found! Build looks great!\n';
     }
 

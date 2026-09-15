@@ -102,7 +102,7 @@ export async function handleGetEquippedItems(context: ItemSkillHandlerContext) {
           if (item.rarity) {
             text += `  Rarity: ${item.rarity}\n`;
           }
-          if (item.active !== undefined) {
+          if (item.active !== undefined && /^(Flask|Charm) \d+$/.test(item.slot)) {
             text += `  Active: ${item.active ? 'Yes' : 'No'}\n`;
           }
           const mods = parseItemRawMods(item.raw);
@@ -196,10 +196,23 @@ export async function handleGetSocketColors(context: ItemSkillHandlerContext) {
 
 export async function handleToggleFlask(
   context: ItemSkillHandlerContext,
-  flaskNumber: number,
-  active: boolean
+  flaskNumber: number | undefined,
+  active: boolean,
+  slotName?: string
 ) {
   return wrapHandler('toggle flask', async () => {
+    const poe2 = process.env.POE_GAME === 'poe2';
+    if (typeof active !== 'boolean') throw new Error('active must be a boolean');
+    if ((flaskNumber !== undefined) === (slotName !== undefined)) {
+      throw new Error('Provide exactly one of flask_number or slotName');
+    }
+    if (slotName !== undefined) {
+      if (!poe2 || typeof slotName !== 'string' || !/^(Flask [12]|Charm [123])$/.test(slotName)) {
+        throw new Error('slotName must be a PoE2 Flask 1/2 or Charm 1/2/3 slot');
+      }
+    } else if (!Number.isInteger(flaskNumber) || flaskNumber! < 1 || flaskNumber! > (poe2 ? 2 : 5)) {
+      throw new Error(`flask_number must be an integer between 1 and ${poe2 ? 2 : 5}`);
+    }
     await context.ensureLuaClient();
 
     const luaClient = context.getLuaClient();
@@ -207,13 +220,9 @@ export async function handleToggleFlask(
       throw new Error('Lua client not initialized. Use lua_start first.');
     }
 
-    if (flaskNumber < 1 || flaskNumber > 5) {
-      throw new Error('flask_number must be between 1 and 5');
-    }
+    await luaClient.setFlaskActive(flaskNumber, active, slotName);
 
-    await luaClient.setFlaskActive(flaskNumber, active);
-
-    let text = `✅ Flask ${flaskNumber} ${active ? 'activated' : 'deactivated'}.`;
+    let text = `✅ ${slotName ?? `Flask ${flaskNumber}`} ${active ? 'activated' : 'deactivated'}.`;
 
     // Return updated key defensive stats so the effect is visible immediately
     try {
@@ -317,9 +326,18 @@ export async function handleSetMainSkill(
   context: ItemSkillHandlerContext,
   socketGroup: number,
   activeSkillIndex?: number,
-  skillPart?: number
+  skillPart?: number,
+  statSet?: number
 ) {
   return wrapHandler('set main skill', async () => {
+    for (const [name, value] of [['group_index', socketGroup], ['active_skill_index', activeSkillIndex], ['skill_part', skillPart], ['stat_set', statSet]] as const) {
+      if ((name === 'group_index' || value !== undefined) && (!Number.isInteger(value) || value! < 1)) {
+        throw new Error(`${name} must be a positive integer`);
+      }
+    }
+    if (statSet !== undefined && process.env.POE_GAME !== 'poe2') {
+      throw new Error('stat_set requires PoE2 mode');
+    }
     await context.ensureLuaClient();
 
     const luaClient = context.getLuaClient();
@@ -327,14 +345,11 @@ export async function handleSetMainSkill(
       throw new Error('Lua client not initialized. Use lua_start first.');
     }
 
-    if (socketGroup < 1) {
-      throw new Error('socket_group must be >= 1');
-    }
-
     await luaClient.setMainSelection({
       mainSocketGroup: socketGroup,
       mainActiveSkill: activeSkillIndex,
       skillPart,
+      ...(statSet === undefined ? {} : { statSet }),
     });
 
     let text = `✅ Main skill set to group ${socketGroup}`;
@@ -344,6 +359,7 @@ export async function handleSetMainSkill(
     if (skillPart !== undefined) {
       text += `, part ${skillPart}`;
     }
+    if (statSet !== undefined) text += `, stat set ${statSet}`;
     text += `.`;
 
     return {
@@ -677,12 +693,16 @@ export async function handleListSpectres(
 
     const result = await luaClient.listSpectres({ search });
 
+    const poe2 = process.env.POE_GAME === 'poe2';
     const parts: string[] = [];
     if (result.active.length === 0) {
-      parts.push('No spectres set on this build (Raise Spectre simulates generic spectres until some are).');
+      parts.push(poe2 ? 'No spectre gem selections in the active skill set.' : 'No spectres set on this build (Raise Spectre simulates generic spectres until some are).');
     } else {
-      parts.push(`Active spectres (${result.active.length}):`);
-      for (const s of result.active) parts.push(`  - ${s.name} (${s.id})`);
+      parts.push(`${poe2 ? 'Spectre gem selections' : 'Active spectres'} (${result.active.length}):`);
+      for (const s of result.active) {
+        const selection = poe2 ? ` — group ${s.groupIndex}, gem ${s.gemIndex}${s.enabled === false ? ' (disabled)' : ''}` : '';
+        parts.push(`  - ${s.name} (${s.id})${selection}`);
+      }
     }
     if (result.search_results) {
       parts.push('');
@@ -700,9 +720,20 @@ export async function handleListSpectres(
 export async function handleSetSpectres(
   context: ItemSkillHandlerContext,
   spectres: string[],
-  mode?: "replace" | "add"
+  mode?: "replace" | "add",
+  groupIndex?: number,
+  gemIndex?: number
 ) {
   return wrapHandler('set spectres', async () => {
+    const poe2 = process.env.POE_GAME === 'poe2';
+    if (!Array.isArray(spectres) || spectres.length === 0 || spectres.some(s => typeof s !== 'string' || !s.trim())) {
+      throw new Error('spectres must be a non-empty array of names or metadata ids');
+    }
+    if (mode !== undefined && mode !== 'replace' && mode !== 'add') throw new Error('invalid spectre mode');
+    if (poe2 && (spectres.length !== 1 || (mode !== undefined && mode !== 'replace') ||
+        !Number.isInteger(groupIndex) || groupIndex! < 1 || !Number.isInteger(gemIndex) || gemIndex! < 1)) {
+      throw new Error('PoE2 selects exactly one spectre per gem: positive group_index and gem_index, mode replace');
+    }
     await context.ensureLuaClient();
 
     const luaClient = context.getLuaClient();
@@ -710,14 +741,10 @@ export async function handleSetSpectres(
       throw new Error('Lua client not initialized. Use lua_start first.');
     }
 
-    if (!Array.isArray(spectres) || spectres.length === 0) {
-      throw new Error('spectres must be a non-empty array of names or metadata ids');
-    }
-
-    const result = await luaClient.setSpectres({ spectres, mode });
+    const result = await luaClient.setSpectres({ spectres, ...(mode === undefined ? {} : { mode }), ...(poe2 ? { groupIndex, gemIndex } : {}) });
 
     const names = result.active.map((s) => s.name).join(', ');
-    const text =
+    const text = poe2 ? `✅ Spectre selected for group ${groupIndex}, gem ${gemIndex}: ${names}.` :
       `✅ Spectre list ${mode === 'add' ? 'extended' : 'replaced'}. Active: ${names || '(none)'}.\n` +
       `Note: spectres persist across character imports (the PoE API never reports them) — ` +
       `re-run this only when the in-game zoo changes.`;

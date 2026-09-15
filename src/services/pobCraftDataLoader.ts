@@ -2,22 +2,28 @@
  * PoB Craft Data Loader — master (bench) crafts + essences.
  *
  * Reads two PoB community data files:
- *   - Data/ModMaster.lua  — deterministic bench crafts ("of Craft" suffixes,
+ *   - Data/ModMaster.lua  — PoE1-only deterministic bench crafts ("of Craft" suffixes,
  *     "Upgraded" prefixes). Flat array; each entry lists which item TYPES it
  *     can be crafted on (e.g. ["Body Armour"]=true).
  *   - Data/Essence.lua    — essences. Each essence guarantees one specific
  *     ModItem.lua mod per item type. Values in `mods` are ModItem.lua IDs,
- *     so we resolve them through pobModDataLoader (no duplication).
+ *     so we resolve them through pobModDataLoader (no duplication). PoB2
+ *     also references lookup-only ModItemExclusive.lua descriptions.
+ *
+ * PoB2 has no ModMaster.lua or equivalent bench pool in this loader. Essence
+ * loading is independent of that missing feature. Bench queries explicitly
+ * throw POB_CRAFT_UNSUPPORTED; rune/socket effects are not bench affixes.
  *
  * Same parse-once-cache pattern as the other loaders.
  *
  * Legal: same posture — PoB redistributes parsed Lua under their license;
  * we don't touch the game's Bundles2/.
  */
-import { readFileSync, statSync, existsSync } from "fs";
-import { join, dirname } from "path";
+import { readFileSync, statSync } from "fs";
+import { join } from "path";
 import luaparse from "luaparse";
 import { getMod, type PobMod } from "./pobModDataLoader.js";
+import { resolvePobDataLocation } from "./pobDataPath.js";
 
 export interface MasterCraft {
   /** "Prefix" or "Suffix". */
@@ -39,10 +45,14 @@ export interface MasterCraft {
 export interface Essence {
   /** Display name, e.g. "Deafening Essence of Greed". */
   name: string;
-  /** Tier 1-7 (higher = stronger). Corrupted essences may differ. */
-  tier: number;
-  /** Numeric category from PoB (groups essences by stat theme). */
-  typeId: number;
+  /** PoE1 tier, or null when the native table does not provide a tier. */
+  tier: number | null;
+  /** PoE1 numeric category, or null for PoB2's string categories. */
+  typeId: number | null;
+  /** Native category, e.g. PoB2 "Life" or PoE1's numeric category. */
+  type?: string | number;
+  /** Native PoB2 level used for ordering; NOT a PoE1 1–7 tier. */
+  tierLevel?: number;
   /** item-type name -> ModItem.lua mod ID guaranteed on that type. */
   mods: Record<string, string>;
 }
@@ -142,7 +152,9 @@ function parseReturnTable(path: string): Record<string, unknown> | unknown[] {
       break;
     }
   }
-  if (!rootTable) throw new Error(`No return statement found in ${path}`);
+  if (!rootTable || rootTable.type !== "TableConstructorExpression") {
+    throw new Error(`No returned craft data table found in ${path}`);
+  }
   return luaToJs(rootTable) as Record<string, unknown> | unknown[];
 }
 
@@ -150,37 +162,11 @@ function parseReturnTable(path: string): Record<string, unknown> | unknown[] {
 // Path resolution
 // ---------------------------------------------------------------------------
 
-function searchUpwardForSuite(start: string): string | null {
-  let dir = start;
-  while (dir && dir !== dirname(dir)) {
-    if (existsSync(join(dir, "pob-mcp", "package.json"))) return dir;
-    dir = dirname(dir);
-  }
-  return null;
-}
-
-function resolveSuiteRoot(): string {
-  if (process.env.POE_MCP_SUITE_ROOT) return process.env.POE_MCP_SUITE_ROOT;
-  const entry = process.argv[1];
-  if (entry) {
-    const found = searchUpwardForSuite(dirname(entry));
-    if (found) return found;
-  }
-  const cwdFound = searchUpwardForSuite(process.cwd());
-  if (cwdFound) return cwdFound;
-  return process.cwd();
-}
-
-function resolvePobDir(): string {
-  if (process.env.POE_MCP_SUITE_POB_DIR) return process.env.POE_MCP_SUITE_POB_DIR;
-  return join(resolveSuiteRoot(), "PathOfBuilding");
-}
-
 function modMasterPath(): string {
-  return join(resolvePobDir(), "src", "Data", "ModMaster.lua");
+  return join(resolvePobDataLocation().dataDir, "ModMaster.lua");
 }
 function essencePath(): string {
-  return join(resolvePobDir(), "src", "Data", "Essence.lua");
+  return join(resolvePobDataLocation().dataDir, "Essence.lua");
 }
 
 // ---------------------------------------------------------------------------
@@ -217,8 +203,7 @@ function normalizeMasterCraft(raw: Record<string, unknown>): MasterCraft {
 // ---------------------------------------------------------------------------
 
 interface CacheEntry {
-  masterMtimeMs: number;
-  essenceMtimeMs: number;
+  signature: string;
   masterCrafts: MasterCraft[];
   /** item-type name -> master crafts available on it. */
   masterByType: Map<string, MasterCraft[]>;
@@ -229,16 +214,18 @@ interface CacheEntry {
 let cached: CacheEntry | null = null;
 
 function load(): CacheEntry {
-  const mPath = modMasterPath();
-  const ePath = essencePath();
-  const mStat = statSync(mPath);
+  const { dataDir, game } = resolvePobDataLocation();
+  const mPath = join(dataDir, "ModMaster.lua");
+  const ePath = join(dataDir, "Essence.lua");
+  const mStat = game === "poe1" ? statSync(mPath) : undefined;
   const eStat = statSync(ePath);
-  if (cached && cached.masterMtimeMs === mStat.mtimeMs && cached.essenceMtimeMs === eStat.mtimeMs) {
+  const signature = JSON.stringify([game, dataDir, mStat?.mtimeMs, mStat?.size, eStat.mtimeMs, eStat.size]);
+  if (cached && cached.signature === signature) {
     return cached;
   }
 
   // Master crafts — flat array
-  const masterRaw = parseReturnTable(mPath);
+  const masterRaw = game === "poe1" ? parseReturnTable(mPath) : [];
   const masterArr: Record<string, unknown>[] = Array.isArray(masterRaw)
     ? (masterRaw as Record<string, unknown>[])
     : Object.values(masterRaw as Record<string, Record<string, unknown>>);
@@ -257,6 +244,7 @@ function load(): CacheEntry {
   const essences: Essence[] = [];
   const essenceByNameLower = new Map<string, Essence>();
   for (const entry of Object.values(essenceRaw)) {
+    if (!entry || typeof entry !== "object") throw new Error(`Invalid essence definition in ${ePath}`);
     const name = typeof entry.name === "string" ? entry.name : "";
     if (!name) continue;
     const modsRaw = (entry.mods ?? {}) as Record<string, unknown>;
@@ -266,17 +254,19 @@ function load(): CacheEntry {
     }
     const e: Essence = {
       name,
-      tier: typeof entry.tier === "number" ? entry.tier : 0,
-      typeId: typeof entry.type === "number" ? entry.type : -1,
+      tier: typeof entry.tier === "number" ? entry.tier : null,
+      typeId: typeof entry.type === "number" ? entry.type : null,
+      ...(typeof entry.type === "string" || typeof entry.type === "number" ? { type: entry.type } : {}),
+      ...(typeof entry.tierLevel === "number" ? { tierLevel: entry.tierLevel } : {}),
       mods,
     };
     essences.push(e);
     essenceByNameLower.set(name.toLowerCase(), e);
   }
 
+  if (essences.length === 0) throw new Error(`No essence definitions found in ${ePath}`);
   cached = {
-    masterMtimeMs: mStat.mtimeMs,
-    essenceMtimeMs: eStat.mtimeMs,
+    signature,
     masterCrafts,
     masterByType,
     essences,
@@ -293,8 +283,22 @@ export function ensureCraftDataLoaded(): void {
   load();
 }
 
+export class PobCraftUnsupportedError extends Error {
+  readonly code = "POB_CRAFT_UNSUPPORTED";
+
+  constructor() {
+    super("PoE2 bench crafting is unsupported: PoB2 has no ModMaster.lua bench-craft data. Rune/socket effects are a separate mechanism; no equivalent bench mod pool is mapped.");
+    this.name = "PobCraftUnsupportedError";
+  }
+}
+
+function loadMasterCrafts(): CacheEntry {
+  if (resolvePobDataLocation().game === "poe2") throw new PobCraftUnsupportedError();
+  return load();
+}
+
 export function getMasterCraftCount(): number {
-  return load().masterCrafts.length;
+  return loadMasterCrafts().masterCrafts.length;
 }
 
 export function getEssenceCount(): number {
@@ -319,7 +323,7 @@ export interface MasterCraftFilters {
  * (different `level`); all are returned unless filtered.
  */
 export function searchMasterCrafts(filters: MasterCraftFilters): MasterCraft[] {
-  const c = load();
+  const c = loadMasterCrafts();
   const stat = filters.statContains?.toLowerCase();
   const type = filters.type?.toLowerCase();
   const itemType = filters.itemType;
@@ -348,7 +352,7 @@ export function matchMasterCraft(
   line: string,
   itemType?: string
 ): MasterCraft | null {
-  const c = load();
+  const c = loadMasterCrafts();
   // Lazy import of the normalizer would create a cycle; reimplement inline.
   const normalize = (s: string) =>
     s
@@ -390,7 +394,7 @@ export function findEssencesMatching(query: string, limit = 20): Essence[] {
 export interface EssenceModResolved {
   itemType: string;
   modId: string;
-  /** Resolved ModItem.lua mod (null if the ID isn't found — shouldn't happen). */
+  /** Item or PoB2 Exclusive description; null when PoB does not describe the ID. */
   mod: PobMod | null;
 }
 

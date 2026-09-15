@@ -86,9 +86,13 @@ describe('PoBLuaTcpClient', () => {
       expect(client.isAlive()).toBe(false);
     });
 
-    it('rejects if connection is refused', async () => {
-      client = new PoBLuaTcpClient({ port: 19999, timeoutMs: 500 });
-      await expect(client.start()).rejects.toThrow(/Cannot connect|ECONNREFUSED/);
+    it('rejects when no service is listening', async () => {
+      // Use a port we know was bound locally; a hard-coded port can be filtered
+      // by a host firewall and time out instead of refusing a connection.
+      const closedServer = await createMockServer();
+      await closedServer.close();
+      client = new PoBLuaTcpClient({ port: closedServer.port, timeoutMs: 500 });
+      await expect(client.start()).rejects.toThrow(/Cannot connect|ECONNREFUSED|ECONNRESET/);
     });
 
     it('marks killed when server closes the connection', async () => {
@@ -176,6 +180,15 @@ describe('PoBLuaTcpClient', () => {
   });
 
   describe('stop()', () => {
+    it('can reconnect the same client after disconnecting', async () => {
+      mock = await createMockServer(sock => sock.write(JSON.stringify(BANNER) + '\n'));
+      client = new PoBLuaTcpClient({ port: mock.port, timeoutMs: 2000 });
+      await client.start();
+      await client.stop();
+      await client.start();
+      expect(client.isAlive()).toBe(true);
+    });
+
     it('disconnects without crashing and isAlive() returns false', async () => {
       mock = await createMockServer((sock) => {
         setTimeout(() => sock.write(JSON.stringify(BANNER) + '\n'), 10);

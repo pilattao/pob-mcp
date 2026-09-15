@@ -398,7 +398,7 @@ export function getPobTreeData(version?: string): PobTreeData {
     loadedSource = "pob-tree-lua";
     return data;
   } catch (pobErr) {
-    if (process.env.POE_GAME === 'poe2') {
+    if (process.env.POE_GAME === 'poe2' || version?.startsWith('0_')) {
       const message = pobErr instanceof Error ? pobErr.message : String(pobErr);
       throw new Error(`PoE2 tree data unavailable: ${message}. Configure POB_INSTALL_DIR with a PoB2 install; PoE1 fallback is disabled.`);
     }

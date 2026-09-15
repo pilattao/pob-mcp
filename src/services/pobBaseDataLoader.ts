@@ -1,7 +1,7 @@
 /**
  * PoB Base Item Data Loader
  *
- * Reads PoB community's `PathOfBuilding/src/Data/Bases/*.lua` and exposes
+ * Reads PoB community's `Data/Bases/*.lua` (install or source) and exposes
  * every base item as a typed JS object. Each base carries the tag chain
  * needed for accurate mod-roll filtering (e.g. an Astral Plate carries
  * ["armour","body_armour","str_armour","top_tier_base_item_type"]) plus
@@ -13,9 +13,10 @@
  * Legal: same posture as the tree and mod loaders — PoB redistributes the
  * parsed Lua under their license; we don't extract from Bundles2/.
  */
-import { readFileSync, statSync, existsSync, readdirSync } from "fs";
-import { join, dirname } from "path";
+import { readFileSync, statSync, readdirSync } from "fs";
+import { join } from "path";
 import luaparse from "luaparse";
+import { resolvePobDataLocation } from "./pobDataPath.js";
 
 export interface PobBaseRequirements {
   level?: number;
@@ -142,34 +143,8 @@ function luaToJs(node: LuaNode | null | undefined): unknown {
 // Path resolution
 // ---------------------------------------------------------------------------
 
-function searchUpwardForSuite(start: string): string | null {
-  let dir = start;
-  while (dir && dir !== dirname(dir)) {
-    if (existsSync(join(dir, "pob-mcp", "package.json"))) return dir;
-    dir = dirname(dir);
-  }
-  return null;
-}
-
-function resolveSuiteRoot(): string {
-  if (process.env.POE_MCP_SUITE_ROOT) return process.env.POE_MCP_SUITE_ROOT;
-  const entry = process.argv[1];
-  if (entry) {
-    const found = searchUpwardForSuite(dirname(entry));
-    if (found) return found;
-  }
-  const cwdFound = searchUpwardForSuite(process.cwd());
-  if (cwdFound) return cwdFound;
-  return process.cwd();
-}
-
-function resolvePobDir(): string {
-  if (process.env.POE_MCP_SUITE_POB_DIR) return process.env.POE_MCP_SUITE_POB_DIR;
-  return join(resolveSuiteRoot(), "PathOfBuilding");
-}
-
 function basesDir(): string {
-  return join(resolvePobDir(), "src", "Data", "Bases");
+  return join(resolvePobDataLocation().dataDir, "Bases");
 }
 
 // ---------------------------------------------------------------------------
@@ -238,8 +213,8 @@ function parseBaseFile(path: string, sourceFile: string): PobBase[] {
 // ---------------------------------------------------------------------------
 
 interface CacheEntry {
-  /** Aggregated mtime — if any file changed, we reload all. */
-  totalMtimeMs: number;
+  /** Includes game, directory, file membership and individual timestamps. */
+  signature: string;
   /** All bases indexed by exact name. */
   byName: Map<string, PobBase>;
   /** Same data indexed by lowercase name for case-insensitive lookup. */
@@ -251,7 +226,8 @@ interface CacheEntry {
 let cached: CacheEntry | null = null;
 
 function load(): CacheEntry {
-  const dir = basesDir();
+  const { dataDir, game } = resolvePobDataLocation();
+  const dir = join(dataDir, "Bases");
   const files = readdirSync(dir, { withFileTypes: true })
     .filter((d) => d.isFile() && d.name.endsWith(".lua"))
     .map((d) => d.name)
@@ -267,30 +243,33 @@ function load(): CacheEntry {
     "mace.lua", "quiver.lua", "ring.lua", "shield.lua", "staff.lua",
     "sword.lua", "wand.lua",
   ]);
-  const eligible = files.filter((f) => EQUIPMENT_FILES.has(f));
+  // PoB2 base lookup covers every declared category, including crossbows,
+  // focuses, spears and non-equipment. A base definition does not establish
+  // item-mod eligibility: e.g. jewels/flasks have separate mod tables, and
+  // hidden/legacy bases are not an availability list. Keep PoE1's scope.
+  const eligible = game === "poe2" ? files : files.filter(f => EQUIPMENT_FILES.has(f));
+  const signature = JSON.stringify([game, dir, eligible.map(f => {
+    const stat = statSync(join(dir, f));
+    return [f, stat.mtimeMs, stat.size];
+  })]);
+  if (cached && cached.signature === signature) return cached;
 
-  // Hash-style mtime aggregator — sum of all mtimes. If any file changes,
-  // the sum changes, and we reload everything.
-  let totalMtime = 0;
-  for (const f of eligible) {
-    totalMtime += statSync(join(dir, f)).mtimeMs;
-  }
-  if (cached && cached.totalMtimeMs === totalMtime) return cached;
-
-  const all: PobBase[] = [];
   const byName = new Map<string, PobBase>();
   const byNameLower = new Map<string, PobBase>();
   for (const f of eligible) {
     const slug = f.replace(/\.lua$/, "");
     const bases = parseBaseFile(join(dir, f), slug);
     for (const b of bases) {
-      all.push(b);
       byName.set(b.name, b);
       byNameLower.set(b.name.toLowerCase(), b);
     }
   }
 
-  cached = { totalMtimeMs: totalMtime, all, byName, byNameLower };
+  // Lua assignments overwrite prior variants of a base. Searches and counts
+  // must use the same final definitions as getBase, not the assignment history.
+  const all = Array.from(byName.values());
+  if (all.length === 0) throw new Error(`No base definitions found in ${dir}`);
+  cached = { signature, all, byName, byNameLower };
   return cached;
 }
 

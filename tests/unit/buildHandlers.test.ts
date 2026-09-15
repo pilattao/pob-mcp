@@ -69,6 +69,64 @@ describe('BuildHandlers', () => {
   });
 
   describe('handleAnalyzeBuild', () => {
+    it('analyzes the live XML when the requested build is already open with unsaved edits', async () => {
+      const fileBuild: any = { Build: { className: 'Witch', level: '93' }, Skills: { SkillSet: { Skill: { Gem: { nameSpec: 'Old saved skill', level: '1', quality: '0' } } } } };
+      const realService = new BuildService('/unused');
+      jest.spyOn(realService, 'readBuild').mockResolvedValue(fileBuild);
+      context.buildService = realService;
+      mockTreeService.analyzePassiveTree.mockResolvedValue(null);
+      context.getLuaClient = () => ({
+        getBuildInfo: async () => ({ name: 'Requested' }),
+        exportBuildXml: async () => '<PathOfBuilding2><Build className="Witch" level="93"/><Skills activeSkillSet="1"><SkillSet id="1"><Skill><Gem nameSpec="Spark" level="20" quality="20"/></Skill></SkillSet></Skills></PathOfBuilding2>',
+        getStats: async () => ({ Life: 2500 }),
+        getSkills: async () => ({ activeSkillSetId: 1 }),
+        listSpecs: async () => ({ specs: [] }),
+        listItemSets: async () => ({ itemSets: [] }),
+      }) as any;
+      const result = await handleAnalyzeBuild(context, 'Requested.xml');
+      expect(result.content[0].text).toContain('Spark (20/20)');
+      expect(result.content[0].text).not.toContain('Old saved skill');
+    });
+    it('does not mix stats from a different open build into the requested file', async () => {
+      mockBuildService.readBuild.mockResolvedValue({ Build: { className: 'Witch', level: '93' } });
+      mockBuildService.generateBuildSummary.mockReturnValue('Requested file build');
+      mockTreeService.analyzePassiveTree.mockResolvedValue(null);
+      context.getLuaClient = () => ({
+        getBuildInfo: async () => ({ name: 'Other Character' }),
+        getStats: async () => ({ Life: 999999 }),
+        listSpecs: async () => ({ specs: [] }),
+        listItemSets: async () => ({ itemSets: [] }),
+      }) as any;
+      const result = await handleAnalyzeBuild(context, 'Requested.xml');
+      expect(result.content[0].text).not.toContain('999999');
+      expect(result.content[0].text).not.toContain('Live Calculated Stats');
+    });
+
+    it('uses the live skill-set ID independently of the active item-set ID', async () => {
+      const build: any = {
+        Build: { className: 'Witch', level: '93' },
+        Items: { activeItemSet: '1', ItemSet: [{ id: '1' }, { id: '2' }] },
+        Skills: { activeSkillSet: '1', SkillSet: [
+          { id: '1', Skill: { Gem: { nameSpec: 'Old skill', level: '1', quality: '0' } } },
+          { id: '2', Skill: { Gem: { nameSpec: 'Wrong item-set skill', level: '1', quality: '0' } } },
+          { id: '3', Skill: { Gem: { nameSpec: 'Spark', level: '20', quality: '20' } } },
+        ] },
+      };
+      mockBuildService.readBuild.mockResolvedValue(build);
+      mockBuildService.generateBuildSummary.mockImplementation(b => new BuildService('/unused').generateBuildSummary(b));
+      mockTreeService.analyzePassiveTree.mockResolvedValue(null);
+      context.getLuaClient = () => ({
+        getBuildInfo: async () => ({ name: 'Requested' }),
+        getStats: async () => ({ Life: 2500 }),
+        getSkills: async () => ({ activeSkillSetId: 3 }),
+        listSpecs: async () => ({ specs: [] }),
+        listItemSets: async () => ({ itemSets: [{ id: 2, active: true, title: 'Gear' }] }),
+      }) as any;
+      const result = await handleAnalyzeBuild(context, 'Requested.xml');
+      expect(result.content[0].text).toContain('Spark (20/20)');
+      expect(result.content[0].text).not.toContain('Wrong item-set skill');
+    });
+
     const mockBuild: PoBBuild = {
       Build: {
         className: 'Ranger',

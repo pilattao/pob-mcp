@@ -22,8 +22,29 @@ Chiming Staff
 +2 to maximum number of Elemental Infusions</Item>
     <Item id="3">Rarity: NORMAL
 Stone Charm</Item>
+    <Item id="4">Rarity: MAGIC
+Potent Ultimate Life Flask of the Ample
+Unique ID: synthetic-life
+Quality: 20
+Implicits: 0
+71% increased Amount Recovered</Item>
+    <Item id="5">Rarity: MAGIC
+Concentrated Ultimate Mana Flask of the Abundant
+Unique ID: synthetic-mana
+Implicits: 0
+67% increased Amount Recovered</Item>
+    <Item id="6">Rarity: RARE
+Test Stone
+Sapphire
+Implicits: 0
+12% increased Critical Hit Chance</Item>
+    <Item id="7">Rarity: UNIQUE
+Heart of the Well
+Diamond
+Implicits: 0
+Gain 12% of Damage as Extra Chaos Damage</Item>
     <ItemSet id="1"><Slot name="Weapon 1" itemId="1"/></ItemSet>
-    <ItemSet id="2"><Slot name="Weapon 1" itemId="1"/><Slot name="Weapon 1 Swap" itemId="2"/><Slot name="Charm 1" itemId="3"/></ItemSet>
+    <ItemSet id="2"><Slot name="Weapon 1" itemId="1"/><Slot name="Weapon 1 Swap" itemId="2"/><Slot name="Charm 1" itemId="3"/><Slot name="Flask 1" itemId="4"/><Slot name="Flask 2" itemId="5"/></ItemSet>
   </Items>
   <Skills activeSkillSet="2">
     <SkillSet id="1"><Skill><Gem nameSpec="Frost Bomb" level="18" quality="20"/></Skill></SkillSet>
@@ -31,7 +52,7 @@ Stone Charm</Item>
   </Skills>
   <Tree activeSpec="1"><Spec treeVersion="0_5" nodes="101,102,103">
     <URL>https://example.test/tree</URL>
-    <WeaponSet1 nodes="102"/><WeaponSet2 nodes="103"/><Sockets/>
+    <WeaponSet1 nodes="102"/><WeaponSet2 nodes="103"/><Sockets><Socket nodeId="101" itemId="6"/><Socket nodeId="102" itemId="7"/></Sockets>
     <Overrides><AttributeOverride strNodes="101" intNodes="102,103"/></Overrides>
   </Spec></Tree>
   <Notes>Verisium &amp; Choir notes</Notes>
@@ -104,5 +125,30 @@ describe('PoE2 build file contract', () => {
     await exports.restoreSnapshot({ buildName: 'Forbidden Rites/Choir.xml', snapshotId: before.snapshotId, backupCurrent: false });
     service.invalidateBuild('Forbidden Rites\\Choir');
     expect((await service.readBuild('Forbidden Rites/Choir.xml')).Build?.level).toBe('93');
+  });
+
+  it('reports two PoE2 flasks and separate charms from the active item set', async () => {
+    const service = new BuildService(directory);
+    const analysis = service.parseFlasks(await service.readBuild('Forbidden Rites/Choir'));
+    expect(analysis).not.toBeNull();
+    expect(analysis!.totalFlasks).toBe(2);
+    expect(analysis!.flaskTypes.life).toBe(1);
+    expect(analysis!.flaskTypes.mana).toBe(1);
+    expect((analysis as any).charms[0].name).toBe('Stone Charm');
+    const text = service.formatFlaskAnalysis(analysis!);
+    expect(text).toContain('2/2');
+    expect(text).toContain('Stone Charm');
+    expect(text).not.toContain('/5');
+    expect(text).not.toContain('of Heat');
+  });
+
+  it('resolves Sapphire/Diamond jewels from tree sockets and item IDs', async () => {
+    const service = new BuildService(directory);
+    const analysis = service.parseJewels(await service.readBuild('Forbidden Rites/Choir'));
+    expect(analysis!.totalJewels).toBe(2);
+    expect(analysis!.socketedJewels).toBe(2);
+    expect(analysis!.socketPlacements.get('101')).toBe('Test Stone');
+    expect(analysis!.socketPlacements.get('102')).toBe('Heart of the Well');
+    expect(analysis!.warnings).toEqual([]);
   });
 });

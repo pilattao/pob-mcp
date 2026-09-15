@@ -315,6 +315,9 @@ export interface Flask {
 }
 
 export interface FlaskAnalysis {
+  game?: "poe1" | "poe2";
+  flaskCapacity?: number;
+  charms?: Flask[];
   totalFlasks: number;
   activeFlasks: number;
   flasks: Flask[];

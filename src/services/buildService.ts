@@ -4,6 +4,7 @@ import path from "path";
 import type { PoBBuild, CachedBuild, ParsedConfiguration, ConfigInput, ConfigSet, Flask, FlaskAnalysis, Jewel, JewelAnalysis } from "../types.js";
 import { resolveBuildPath } from "../utils/pathSanitizer.js";
 import { unwrapBuildXml } from "../utils/buildXml.js";
+import { parseItemRawMods } from "../utils/itemRawParser.js";
 
 const CACHE_TTL_MS = 60_000;  // 60 seconds
 const CACHE_MAX_SIZE = 20;
@@ -65,8 +66,7 @@ export class BuildService {
 
     // Cache miss or expired — read from file
     const content = await fs.readFile(buildPath, "utf-8");
-    const parsed = this.parser.parse(content);
-    const buildData = unwrapBuildXml(parsed, content);
+    const buildData = this.parseBuildContent(content);
 
     // Evict oldest entry if at capacity
     if (this.buildCache.size >= CACHE_MAX_SIZE) {
@@ -77,6 +77,10 @@ export class BuildService {
 
     this.buildCache.set(buildPath, { data: buildData, timestamp: Date.now() });
     return buildData;
+  }
+
+  parseBuildContent(content: string): PoBBuild {
+    return unwrapBuildXml(this.parser.parse(content), content);
   }
 
   generateBuildSummary(build: PoBBuild): string {
@@ -437,14 +441,21 @@ export class BuildService {
    * Parse flask setup from a PoB build
    * Extracts all equipped flasks with their mods and identifies immunities
    */
+  getActiveItemSet(build: PoBBuild): any {
+    const raw: any = build.Items?.ItemSet;
+    const sets = raw ? (Array.isArray(raw) ? raw : [raw]) : [];
+    const active = String((build.Items as any)?.activeItemSet ?? '1');
+    return sets.find((set: any) => String(set.id) === active) ?? sets[0] ?? null;
+  }
+
   parseFlasks(build: PoBBuild): FlaskAnalysis | null {
-    if (!build.Items?.ItemSet?.Slot) {
-      return null;
-    }
+    const itemSet = this.getActiveItemSet(build);
+    if (!itemSet?.Slot) return null;
+    const poe2 = build.__xmlRoot === 'PathOfBuilding2';
 
     // Build a map of items by ID
     const itemMap = new Map<string, string>();
-    if (build.Items.Item) {
+    if (build.Items?.Item) {
       const items = Array.isArray(build.Items.Item)
         ? build.Items.Item
         : [build.Items.Item];
@@ -456,13 +467,12 @@ export class BuildService {
       }
     }
 
-    const slots = Array.isArray(build.Items.ItemSet.Slot)
-      ? build.Items.ItemSet.Slot
-      : [build.Items.ItemSet.Slot];
+    const slots: any[] = Array.isArray(itemSet.Slot) ? itemSet.Slot : [itemSet.Slot];
 
-    // Find flask slots (Flask 1-5)
+    const flaskCapacity = poe2 ? 2 : 5;
+    // PoE2 has separate life/mana flasks and charms.
     const flaskSlots = slots.filter(slot =>
-      slot.name && slot.name.startsWith('Flask ')
+      slot.name && (poe2 ? /^Flask [12]$/.test(slot.name) : slot.name.startsWith('Flask '))
     );
 
     if (flaskSlots.length === 0) {
@@ -544,15 +554,15 @@ export class BuildService {
       warnings.push('No flasks equipped');
     }
 
-    if (flasks.length < 5) {
-      warnings.push(`Only ${flasks.length}/5 flask slots filled`);
+    if (flasks.length < flaskCapacity) {
+      warnings.push(`Only ${flasks.length}/${flaskCapacity} flask slots filled`);
     }
 
-    if (!hasBleedImmunity) {
+    if (!poe2 && !hasBleedImmunity) {
       recommendations.push('Add bleed immunity (common: "of Staunching" suffix on life flask)');
     }
 
-    if (!hasFreezeImmunity) {
+    if (!poe2 && !hasFreezeImmunity) {
       recommendations.push('Add freeze immunity (common: "of Heat" suffix or flask with chill/freeze immunity)');
     }
 
@@ -561,8 +571,20 @@ export class BuildService {
     }
 
     const activeCount = flasks.filter(f => f.isActive).length;
+    const charms: Flask[] = [];
+    if (poe2) {
+      for (const slot of slots.filter(s => /^Charm \d+$/.test(s.name ?? ''))) {
+        const raw = slot.Item ?? itemMap.get(slot.itemId);
+        if (!raw) continue;
+        const parsed = this.parseFlaskItem(raw, Number(slot.name.split(' ')[1]), slot.active === true || slot.active === 'true');
+        if (parsed) { parsed.id = `charm_${parsed.slotNumber}`; charms.push(parsed); }
+      }
+    }
 
     return {
+      game: poe2 ? 'poe2' : 'poe1',
+      flaskCapacity,
+      charms,
       totalFlasks: flasks.length,
       activeFlasks: activeCount,
       flasks,
@@ -593,7 +615,7 @@ export class BuildService {
       baseType = lines[2] || name;
     } else {
       // For magic/rare, extract base from name or use line 2
-      baseType = lines[2] || this.extractFlaskBase(name);
+      baseType = lines[2] && !/^[A-Za-z][A-Za-z ]*:/.test(lines[2]) ? lines[2] : this.extractFlaskBase(name);
     }
 
     // Parse quality and level requirement
@@ -667,7 +689,7 @@ export class BuildService {
       levelRequirement,
       prefix,
       suffix,
-      mods,
+      mods: /^Implicits:/m.test(itemText) ? parseItemRawMods(itemText).map(m => m.line) : mods,
       isUnique,
       variant,
     };
@@ -677,6 +699,10 @@ export class BuildService {
     // Extract base flask type from magic/rare name
     // e.g., "Surgeon's Diamond Flask of Rupturing" -> "Diamond Flask"
 
+    const tiered = name.match(/(\w+ (?:Life|Mana|Hybrid) Flask)(?: of .*)?$/);
+    if (tiered) return tiered[1];
+    const charm = name.match(/(\w+ Charm)(?: of .*)?$/);
+    if (charm) return charm[1];
     const flaskTypes = [
       'Life Flask', 'Mana Flask', 'Hybrid Flask',
       'Ruby Flask', 'Sapphire Flask', 'Topaz Flask', 'Granite Flask',
@@ -701,6 +727,20 @@ export class BuildService {
    * Format flask analysis for display
    */
   formatFlaskAnalysis(analysis: FlaskAnalysis): string {
+    if (analysis.game === 'poe2') {
+      const lines = ['=== PoE2 Flasks and Charms ===', '', `Flasks Equipped: ${analysis.totalFlasks}/2`];
+      for (const flask of analysis.flasks) {
+        lines.push('', `Flask ${flask.slotNumber}: ${flask.name}`, `  Base: ${flask.baseType}`);
+        for (const mod of flask.mods) lines.push(`  - ${mod}`);
+      }
+      lines.push('', `Charms Equipped: ${analysis.charms?.length ?? 0}`);
+      for (const charm of analysis.charms ?? []) {
+        lines.push('', `Charm ${charm.slotNumber}: ${charm.name}`);
+        for (const mod of charm.mods) lines.push(`  - ${mod}`);
+      }
+      lines.push('', ...analysis.warnings);
+      return lines.join('\n');
+    }
     let output = '=== Flask Setup ===\n\n';
 
     output += `Flasks Equipped: ${analysis.totalFlasks}/5\n`;
@@ -784,9 +824,11 @@ export class BuildService {
       return null;
     }
 
-    const itemSet = build.Items.ItemSet;
-    const slots = itemSet.Slot ? (Array.isArray(itemSet.Slot) ? itemSet.Slot : [itemSet.Slot]) : [];
-    const socketMappings = itemSet.SocketIdURL ? (Array.isArray(itemSet.SocketIdURL) ? itemSet.SocketIdURL : [itemSet.SocketIdURL]) : [];
+    const itemSet = this.getActiveItemSet(build);
+    const slots: any[] = itemSet?.Slot ? (Array.isArray(itemSet.Slot) ? itemSet.Slot : [itemSet.Slot]) : [];
+    const socketMappings: any[] = itemSet?.SocketIdURL ? [...(Array.isArray(itemSet.SocketIdURL) ? itemSet.SocketIdURL : [itemSet.SocketIdURL])] : [];
+    const treeSockets = this.getActiveSpec(build)?.Sockets?.Socket;
+    if (treeSockets) socketMappings.push(...(Array.isArray(treeSockets) ? treeSockets : [treeSockets]));
 
     // Build a map of itemId -> socket info
     const socketMap = new Map<string, { nodeId: string; name: string }>();
@@ -814,16 +856,31 @@ export class BuildService {
       notables: [] as string[],
     };
 
-    // Parse jewels from slots
-    for (const slot of slots) {
-      if (!slot.Item || !slot.name) continue;
-
-      // Check if this is a jewel slot (by item text containing "Jewel")
+    const isJewel = (text: string) => {
+      const lines = text.trim().split('\n').map(s => s.trim());
+      const base = lines[0] === 'Rarity: NORMAL' ? lines[1] : lines[2] ?? lines[1] ?? '';
+      return /\bJewel\b/.test(base) || /^(?:Time-Lost )?(?:Ruby|Emerald|Sapphire|Diamond)$/.test(base);
+    };
+    const candidates = new Map<string, { Item: string; itemId?: string; name: string }>();
+    const rawItems: any = build.Items.Item;
+    for (const item of rawItems ? (Array.isArray(rawItems) ? rawItems : [rawItems]) : []) {
+      if (item['#text'] && (socketMap.has(String(item.id)) || isJewel(item['#text']))) {
+        candidates.set(String(item.id), { Item: item['#text'], itemId: String(item.id), name: socketMap.get(String(item.id))?.name ?? '' });
+      }
+    }
+    for (const [index, slot] of slots.entries()) {
+      if (slot.Item && isJewel(slot.Item)) {
+        candidates.set(slot.itemId ?? `inline-${index}`, { Item: slot.Item, itemId: slot.itemId, name: slot.name ?? '' });
+      }
+    }
+    for (const slot of candidates.values()) {
       const itemText = slot.Item;
-      if (!itemText.includes('Jewel')) continue;
 
       const jewel = this.parseJewelItem(itemText, slot.itemId);
       if (jewel) {
+        if (build.__xmlRoot === 'PathOfBuilding2' && /^Implicits:/m.test(itemText)) {
+          jewel.mods = parseItemRawMods(itemText).map(m => m.line);
+        }
         // Check if jewel is socketed
         if (slot.itemId && socketMap.has(slot.itemId)) {
           const socketInfo = socketMap.get(slot.itemId)!;

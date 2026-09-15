@@ -20,6 +20,7 @@ const ITEM_TRAILER_LINES = new Set([
   "Corrupted", "Fractured Item", "Mirrored", "Split", "Synthesised Item",
   "Veiled Prefix", "Veiled Suffix", "Elder Item", "Shaper Item",
   "Warlord Item", "Crusader Item", "Redeemer Item", "Hunter Item",
+  "Sanctified",
 ]);
 
 /**
@@ -45,12 +46,14 @@ export function parseItemRawMods(raw: string | undefined): ParsedModLine[] {
     }
     if (!pastImplicitsLine) continue;
     if (ITEM_TRAILER_LINES.has(rawLine)) continue;
-    if (/^[A-Z][A-Za-z ]+:\s/.test(rawLine) && !/^[+\-\d]/.test(rawLine)) continue;
+    if (/^[A-Z][A-Za-z ]+:\s/.test(rawLine) && !/^[+\-\d]/.test(rawLine) && !/^(Grants Skill|Bonded):/.test(rawLine)) continue;
 
-    let crafted = false, fractured = false, scourge = false, crucible = false;
+    let crafted = false, fractured = false, scourge = false, crucible = false, enchant = false, desecrated = false;
     const displayLine = rawLine
       .replace(/\{(\w+)(?::[^}]*)?\}/g, (_m, tag) => {
         if (tag === "crafted") crafted = true;
+        else if (tag === "enchant") enchant = true;
+        else if (tag === "desecrated") desecrated = true;
         else if (tag === "fractured") fractured = true;
         else if (tag === "scourge") scourge = true;
         else if (tag === "crucible") crucible = true;
@@ -63,10 +66,12 @@ export function parseItemRawMods(raw: string | undefined): ParsedModLine[] {
 
     const totalSoFar = enchantCount + implicitCount;
     let type: string;
-    if (crafted && totalSoFar < implicitTotal) {
+    if ((crafted || enchant) && totalSoFar < implicitTotal) {
       type = "enchant"; enchantCount++;
     } else if (!crafted && totalSoFar < implicitTotal) {
       type = "implicit"; implicitCount++;
+    } else if (desecrated) {
+      type = "desecrated";
     } else if (fractured) {
       type = "fractured";
     } else if (scourge) {

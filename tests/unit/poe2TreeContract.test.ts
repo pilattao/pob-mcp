@@ -1,8 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { getPobTreeData, getLoadedVersion } from '../../src/services/pobTreeDataLoader.js';
+import { TreeService } from '../../src/services/treeService.js';
+import { BuildService } from '../../src/services/buildService.js';
 
 function tree(name: string) {
   return `return {nodes={
@@ -64,5 +66,16 @@ describe('PoE2 installed tree contract', () => {
     fs.writeFileSync(path.join(fallback, 'data.json'), JSON.stringify({ nodes: { 999: { name: 'PoE1 Only' } }, groups: {} }));
     process.env.POE_MCP_SUITE_ROOT = directory;
     expect(() => getPobTreeData()).toThrow(/PoE2|poe2/);
+  });
+
+  it('uses the native PoB2 graph in the main build-analysis service', async () => {
+    const service = new TreeService(new BuildService(directory));
+    const oldSource = jest.spyOn(service, 'fetchTreeDataFromRepo').mockRejectedValue(new Error('PoE1 network source must not be used'));
+    try {
+      const tree = await service.getTreeData('0_5');
+      expect(tree.version).toBe('0_5');
+      expect(tree.nodes.get('101')?.name).toBe('First');
+      expect(tree.nodes.get('102')?.out).toContain('101');
+    } finally { oldSource.mockRestore(); }
   });
 });

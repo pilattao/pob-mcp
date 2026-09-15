@@ -609,6 +609,15 @@ export function getToolSchemas(): ToolSchema[] {
  * Get Lua-specific tool schemas (only included if Lua is enabled)
  */
 export function getLuaToolSchemas(): any[] {
+  const poe2 = process.env.POE_GAME === "poe2";
+  const legacySlots = ["Weapon 1", "Weapon 2", "Helmet", "Body Armour", "Gloves", "Boots", "Amulet", "Ring 1", "Ring 2", "Belt", "Flask 1", "Flask 2", "Flask 3", "Flask 4", "Flask 5"];
+  // SkillsTab's slot-linked groups attach to equipment; consumables are item slots only.
+  const skillSlots = poe2
+    ? ["Weapon 1", "Weapon 2", "Weapon 1 Swap", "Weapon 2 Swap", "Helmet", "Body Armour", "Gloves", "Boots", "Amulet", "Ring 1", "Ring 2", "Ring 3", "Belt"]
+    : legacySlots;
+  const equipmentSlots = poe2
+    ? [...skillSlots, "Flask 1", "Flask 2", "Charm 1", "Charm 2", "Charm 3", "Arm 1", "Arm 2", "Leg 1", "Leg 2"]
+    : legacySlots;
   return [
     {
       name: "lua_start",
@@ -958,12 +967,18 @@ export function getLuaToolSchemas(): any[] {
           },
           classId: {
             type: "number",
-            description: "Class ID (0=Scion, 1=Marauder, 2=Ranger, 3=Witch, 4=Duelist, 5=Templar, 6=Shadow). If omitted, preserves current class.",
+            description: "PoB2 class ID from lua_get_tree. Omit to preserve the current class; do not use PoE1 class IDs.",
           },
           ascendClassId: {
             type: "number",
-            description: "Ascendancy class ID (0=None, 1-3 class-specific). Scion: 1=Ascendant | Marauder: 1=Juggernaut, 2=Berserker, 3=Chieftain | Ranger: 1=Raider, 2=Deadeye, 3=Pathfinder | Witch: 1=Occultist, 2=Elementalist, 3=Necromancer | Duelist: 1=Slayer, 2=Gladiator, 3=Champion | Templar: 1=Inquisitor, 2=Hierophant, 3=Guardian | Shadow: 1=Assassin, 2=Trickster, 3=Saboteur",
+            description: "PoB2 ascendancy ID from lua_get_tree. Omit to preserve the current ascendancy.",
           },
+          weaponSets: {
+            type: "object",
+            additionalProperties: { type: "integer", enum: [0, 1, 2] },
+            description: "PoB2 node ID to allocation mode: 0 common, 1 weapon set 1, 2 weapon set 2. Omit to preserve assignments; an empty object makes all requested nodes common.",
+          },
+          treeVersion: { type: "string", description: "PoB2 tree version from lua_get_tree, e.g. 0_5. Omit to preserve." },
         },
         required: ["nodes"],
       },
@@ -1061,8 +1076,8 @@ export function getLuaToolSchemas(): any[] {
           },
           slot_name: {
             type: "string",
-            description: "Slot to equip in: Weapon 1, Weapon 2, Helmet, Body Armour, Gloves, Boots, Amulet, Ring 1, Ring 2, Belt, Flask 1-5",
-            enum: ["Weapon 1", "Weapon 2", "Helmet", "Body Armour", "Gloves", "Boots", "Amulet", "Ring 1", "Ring 2", "Belt", "Flask 1", "Flask 2", "Flask 3", "Flask 4", "Flask 5"],
+            description: `Equipment slot to equip: ${equipmentSlots.join(", ")}`,
+            enum: equipmentSlots,
           },
         },
         required: ["item_text", "slot_name"],
@@ -1076,8 +1091,8 @@ export function getLuaToolSchemas(): any[] {
         properties: {
           slot_name: {
             type: 'string',
-            description: 'Slot to clear: Weapon 1, Weapon 2, Helmet, Body Armour, Gloves, Boots, Amulet, Ring 1, Ring 2, Belt, Flask 1-5',
-            enum: ['Weapon 1', 'Weapon 2', 'Helmet', 'Body Armour', 'Gloves', 'Boots', 'Amulet', 'Ring 1', 'Ring 2', 'Belt', 'Flask 1', 'Flask 2', 'Flask 3', 'Flask 4', 'Flask 5'],
+            description: `Equipment slot to clear: ${equipmentSlots.join(", ")}`,
+            enum: equipmentSlots,
           },
         },
         required: ['slot_name'],
@@ -1101,20 +1116,30 @@ export function getLuaToolSchemas(): any[] {
     },
     {
       name: "toggle_flask",
-      description: "Toggle a flask on/off",
+      description: poe2
+        ? "Activate or deactivate a PoE2 flask or charm. Provide exactly one selector: flask_number 1 (life) or 2 (mana), or slotName for a Flask or Charm slot."
+        : "Toggle a flask on/off",
       inputSchema: {
         type: "object",
         properties: {
           flask_number: {
-            type: "number",
-            description: "Flask slot number (1-5)",
+            type: "integer",
+            minimum: 1,
+            maximum: poe2 ? 2 : 5,
+            description: poe2 ? "Flask slot number: 1 life, 2 mana. Omit when using slotName." : "Flask slot number (1-5)",
           },
+          ...(poe2 ? { slotName: {
+            type: "string",
+            enum: ["Flask 1", "Flask 2", "Charm 1", "Charm 2", "Charm 3"],
+            description: "Explicit PoB2 consumable slot. Omit flask_number when using slotName.",
+          } } : {}),
           active: {
             type: "boolean",
             description: "true to activate, false to deactivate",
           },
         },
-        required: ["flask_number", "active"],
+        required: poe2 ? ["active"] : ["flask_number", "active"],
+        ...(poe2 ? { oneOf: [{ required: ["flask_number"] }, { required: ["slotName"] }] } : {}),
       },
     },
     {
@@ -1144,13 +1169,18 @@ export function getLuaToolSchemas(): any[] {
             type: "number",
             description: "Active skill index within group (1-based, optional). Selects which active skill in the group to use for DPS calculation — relevant when a group has multiple active skills.",
           },
+          skill_part: { type: "integer", minimum: 1, description: "Skill part index (1-based, optional)." },
+          ...(poe2 ? { stat_set: {
+            type: "integer", minimum: 1,
+            description: "PoE2 stat-set index within the selected active skill (1-based). Updates MAIN and CALCS selections; independent of skill_part.",
+          } } : {}),
         },
         required: ["group_index"],
       },
     },
     {
       name: "create_socket_group",
-      description: "Create a new socket group for skill gems",
+      description: poe2 ? "Create a gem group in the active PoE2 skill set. To support an item-granted skill, create a separate support group in that equipment slot; generated groups are read-only." : "Create a new socket group for skill gems",
       inputSchema: {
         type: "object",
         properties: {
@@ -1161,7 +1191,7 @@ export function getLuaToolSchemas(): any[] {
           slot: {
             type: "string",
             description: "Item slot for sockets (e.g., 'Weapon 1', 'Body Armour')",
-            enum: ["Weapon 1", "Weapon 2", "Helmet", "Body Armour", "Gloves", "Boots", "Amulet", "Ring 1", "Ring 2", "Belt", "Flask 1", "Flask 2", "Flask 3", "Flask 4", "Flask 5"],
+            enum: skillSlots,
           },
           enabled: {
             type: "boolean",
@@ -1309,35 +1339,40 @@ export function getLuaToolSchemas(): any[] {
     },
     {
       name: "list_spectres",
-      description: "List the spectres set on the build (the 'raised' set PoB simulates for Raise Spectre), and optionally search PoB's full spectre library by name. IMPORTANT: character imports NEVER set spectres — the PoE API doesn't report them — so a build with none set simulates generic spectres and misses any player/ally buffs (e.g. Perfect Guardian Turtle's Determination aura). Spectre benefits are also greppable in reference_data/text_lake/spectres.txt (grants: column).",
+      description: poe2 ? "List the spectre selected per gem in the active PoE2 skill set, including group/gem indices and enabled state. Optionally search the installed spectre catalog." : "List the spectres set on the build (the 'raised' set PoB simulates for Raise Spectre), and optionally search PoB's full spectre library by name. IMPORTANT: character imports NEVER set spectres — the PoE API doesn't report them — so a build with none set simulates generic spectres and misses any player/ally buffs (e.g. Perfect Guardian Turtle's Determination aura). Spectre benefits are also greppable in reference_data/text_lake/spectres.txt (grants: column).",
       inputSchema: {
         type: "object",
         properties: {
           search: {
             type: "string",
-            description: "Optional case-insensitive substring to search the spectre library (e.g. 'turtle', 'perfect')",
+            description: poe2 ? "Optional case-insensitive substring to search the installed PoE2 spectre catalog." : "Optional case-insensitive substring to search the spectre library (e.g. 'turtle', 'perfect')",
           },
         },
       },
     },
     {
       name: "set_spectres",
-      description: "Set which spectres are 'raised' on the build — the GUI-only spectre picker, now scriptable. Accepts display names (fuzzy: exact id → exact name → unique substring, e.g. 'perfect guardian turtle') or monster metadata ids. Replaces the whole list by default; mode 'add' appends. Triggers a recalc, so player-affecting spectre auras (Determination, Onslaught, etc.) show up in stats immediately. Spectres persist across imports — set once, re-set only when the in-game zoo changes.",
+      description: poe2 ? "Select exactly one spectre per gem using group_index and gem_index from the active skill set. Pass one catalog name or metadata ID. Use separate gems/groups for different spectres. Updates that gem selection and the shared catalog, then recalculates." : "Set which spectres are 'raised' on the build — the GUI-only spectre picker, now scriptable. Accepts display names (fuzzy: exact id → exact name → unique substring, e.g. 'perfect guardian turtle') or monster metadata ids. Replaces the whole list by default; mode 'add' appends. Triggers a recalc, so player-affecting spectre auras (Determination, Onslaught, etc.) show up in stats immediately. Spectres persist across imports — set once, re-set only when the in-game zoo changes.",
       inputSchema: {
         type: "object",
         properties: {
           spectres: {
             type: "array",
             items: { type: "string" },
-            description: "Spectre names or metadata ids, e.g. ['Perfect Guardian Turtle', 'Perfect Forest Warrior']",
+            ...(poe2 ? { minItems: 1, maxItems: 1 } : {}),
+            description: poe2 ? "Exactly one PoE2 spectre name or metadata ID for this gem." : "Spectre names or metadata ids, e.g. ['Perfect Guardian Turtle', 'Perfect Forest Warrior']",
           },
           mode: {
             type: "string",
-            enum: ["replace", "add"],
-            description: "'replace' (default) sets exactly this list; 'add' appends to the existing list",
+            enum: poe2 ? ["replace"] : ["replace", "add"],
+            description: poe2 ? "replace selects the spectre for this gem (default)." : "'replace' (default) sets exactly this list; 'add' appends to the existing list",
           },
+          ...(poe2 ? {
+            group_index: { type: "integer", minimum: 1, description: "Group index in the active skill set (1-based)." },
+            gem_index: { type: "integer", minimum: 1, description: "Spectre gem index within that group (1-based)." },
+          } : {}),
         },
-        required: ["spectres"],
+        required: poe2 ? ["spectres", "group_index", "gem_index"] : ["spectres"],
       },
     },
     {
@@ -1384,7 +1419,7 @@ export function getLuaToolSchemas(): any[] {
           slot: {
             type: "string",
             description: "Item slot (optional)",
-            enum: ["Weapon 1", "Weapon 2", "Helmet", "Body Armour", "Gloves", "Boots", "Amulet", "Ring 1", "Ring 2", "Belt", "Flask 1", "Flask 2", "Flask 3", "Flask 4", "Flask 5"],
+            enum: skillSlots,
           },
         },
         required: ["label", "active_gem", "support_gems"],

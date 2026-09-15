@@ -494,6 +494,7 @@ export async function handleLuaSetTree(context: LuaHandlerContext, args: any) {
       secondaryAscendClassId,
       nodes: (args.nodes as string[]).map(Number),
       masteryEffects: args.masteryEffects,
+      weaponSets: args.weaponSets,
       treeVersion,
     });
 

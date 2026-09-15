@@ -1,7 +1,7 @@
 /**
  * PoB Mod Data Loader
  *
- * Reads PoB community's `PathOfBuilding/src/Data/ModItem.lua` — PoB's parsed
+ * Reads PoB community's `Data/ModItem.lua` (install or source) — PoB's parsed
  * mirror of GGG's rare/magic item mod table — and exposes it as typed JS
  * objects. The data covers every prefix/suffix that can roll on equipment
  * (rings, amulets, body armour, weapons, etc.) including essences,
@@ -16,8 +16,9 @@
  * game's `Bundles2/` — we just read PoB's distributed `Data/ModItem.lua`.
  */
 import { readFileSync, statSync, existsSync } from "fs";
-import { join, dirname } from "path";
+import { join } from "path";
 import luaparse from "luaparse";
+import { resolvePobDataLocation } from "./pobDataPath.js";
 
 export interface PobMod {
   /** Stable ID from PoB's table, e.g. "Strength1", "IncreasedLife12". */
@@ -49,6 +50,8 @@ export interface PobMod {
    * anything not otherwise listed", `default = 1000` means "rolls on
    * everything not otherwise excluded". Use `resolveWeightForTag` below
    * to do this correctly.
+   * Native PoB2 currently supplies 1/0 eligibility values here, not measured
+   * relative spawn frequencies. Preserve them; they do not establish odds.
    */
   weights: Array<{ tag: string; weight: number }>;
   /** Free-form tag list, e.g. ["attribute"], ["resource", "life"], ["damage", "fire"]. */
@@ -146,32 +149,6 @@ function luaToJs(node: LuaNode | null | undefined): unknown {
 // Path resolution (mirrors pobTreeDataLoader)
 // ---------------------------------------------------------------------------
 
-function searchUpwardForSuite(start: string): string | null {
-  let dir = start;
-  while (dir && dir !== dirname(dir)) {
-    if (existsSync(join(dir, "pob-mcp", "package.json"))) return dir;
-    dir = dirname(dir);
-  }
-  return null;
-}
-
-function resolveSuiteRoot(): string {
-  if (process.env.POE_MCP_SUITE_ROOT) return process.env.POE_MCP_SUITE_ROOT;
-  const entry = process.argv[1];
-  if (entry) {
-    const found = searchUpwardForSuite(dirname(entry));
-    if (found) return found;
-  }
-  const cwdFound = searchUpwardForSuite(process.cwd());
-  if (cwdFound) return cwdFound;
-  return process.cwd();
-}
-
-function resolvePobDir(): string {
-  if (process.env.POE_MCP_SUITE_POB_DIR) return process.env.POE_MCP_SUITE_POB_DIR;
-  return join(resolveSuiteRoot(), "PathOfBuilding");
-}
-
 /**
  * PoB split the monolithic `Data/ModItem.lua` into per-category files in commit 0b6e7a9b2
  * ("Export trade hashes for mod stats"); explicit item mods now live in `ModExplicit.lua`.
@@ -179,17 +156,17 @@ function resolvePobDir(): string {
  * find whichever file this PoB version ships. Prefer the new name, fall back to the old one
  * so older PoB checkouts keep working.
  */
-const MOD_FILE_CANDIDATES = ["ModExplicit.lua", "ModItem.lua"] as const;
-
-function modItemPath(): string {
-  const dataDir = join(resolvePobDir(), "src", "Data");
-  for (const name of MOD_FILE_CANDIDATES) {
+function modItemPath(location = resolvePobDataLocation()): string {
+  const { dataDir, game } = location;
+  // PoB2 Modules/Data.lua loads ModItem, not PoE1's split ModExplicit table.
+  const candidates = game === "poe2" ? ["ModItem.lua"] : ["ModExplicit.lua", "ModItem.lua"];
+  for (const name of candidates) {
     const candidate = join(dataDir, name);
     if (existsSync(candidate)) return candidate;
   }
   throw new Error(
-    `PoB item-mod data not found in ${dataDir} — looked for ${MOD_FILE_CANDIDATES.join(", ")}. ` +
-      `Check the PathOfBuilding submodule is checked out (or set POE_MCP_SUITE_POB_DIR).`,
+    `PoB item-mod data not found in ${dataDir} — looked for ${candidates.join(", ")}. ` +
+      `Set POB_INSTALL_DIR to the intended PoB install or source checkout.`,
   );
 }
 
@@ -198,8 +175,10 @@ function modItemPath(): string {
 // ---------------------------------------------------------------------------
 
 interface CacheEntry {
-  mtimeMs: number;
+  signature: string;
   mods: Record<string, PobMod>;
+  /** PoB2 lookup-only definitions, never part of the equipment rolling pool. */
+  exclusiveMods: Record<string, PobMod>;
   byGroup: Map<string, PobMod[]>;
   byTag: Map<string, PobMod[]>;
   /**
@@ -328,11 +307,7 @@ function normalizeMod(id: string, raw: Record<string, unknown>): PobMod {
   };
 }
 
-function load(): CacheEntry {
-  const path = modItemPath();
-  const stat = statSync(path);
-  if (cached && cached.mtimeMs === stat.mtimeMs) return cached;
-
+function parseModFile(path: string): Record<string, Record<string, unknown>> {
   const source = readFileSync(path, "utf-8");
   const ast = luaparse.parse(source, { comments: false, ranges: false });
   let rootTable: LuaNode | null = null;
@@ -342,13 +317,38 @@ function load(): CacheEntry {
       break;
     }
   }
-  if (!rootTable) throw new Error(`No return statement found in ${path}`);
+  if (!rootTable || rootTable.type !== "TableConstructorExpression") {
+    throw new Error(`No returned mod table found in ${path}`);
+  }
   const parsed = luaToJs(rootTable) as Record<string, Record<string, unknown>>;
   if (!parsed || typeof parsed !== "object") {
     throw new Error(`Failed to parse ${path}: top-level is not an object`);
   }
 
-  const mods: Record<string, PobMod> = {};
+  for (const [id, entry] of Object.entries(parsed)) {
+    if (!entry || typeof entry !== "object") throw new Error(`Invalid mod definition ${id} in ${path}`);
+  }
+  return parsed;
+}
+
+function load(): CacheEntry {
+  const location = resolvePobDataLocation();
+  const path = modItemPath(location);
+  const exclusivePath = join(location.dataDir, "ModItemExclusive.lua");
+  // PoB2's ItemsTab resolves essence IDs from Item first, then Exclusive.
+  // Missing descriptions stay unresolved; no synthetic mod is substituted.
+  const paths = [path];
+  if (location.game === "poe2" && existsSync(exclusivePath)) paths.push(exclusivePath);
+  const signature = JSON.stringify([location.game, paths.map(p => {
+    const stat = statSync(p);
+    return [p, stat.mtimeMs, stat.size];
+  })]);
+  if (cached && cached.signature === signature) return cached;
+
+  const parsed = parseModFile(path);
+  if (Object.keys(parsed).length === 0) throw new Error(`No item mod definitions found in ${path}`);
+  const mods: Record<string, PobMod> = Object.create(null);
+  const exclusiveMods: Record<string, PobMod> = Object.create(null);
   const byGroup = new Map<string, PobMod[]>();
   const byTag = new Map<string, PobMod[]>();
   const byFirstStatTemplate = new Map<string, PobMod[]>();
@@ -373,7 +373,13 @@ function load(): CacheEntry {
     }
   }
 
-  cached = { mtimeMs: stat.mtimeMs, mods, byGroup, byTag, byFirstStatTemplate };
+  if (paths.length > 1) {
+    for (const [id, rawEntry] of Object.entries(parseModFile(exclusivePath))) {
+      exclusiveMods[id] = normalizeMod(id, rawEntry);
+    }
+  }
+
+  cached = { signature, mods, exclusiveMods, byGroup, byTag, byFirstStatTemplate };
   return cached;
 }
 
@@ -417,11 +423,12 @@ export function ensureLoaded(): void {
 }
 
 /**
- * Get a single mod entry by ID. Returns null if not found.
+ * Get a single mod entry by ID, including PoB2's lookup-only Exclusive table.
+ * Item definitions win on duplicate IDs. Returns null for missing descriptions.
  */
 export function getMod(id: string): PobMod | null {
   const c = load();
-  return c.mods[id] ?? null;
+  return c.mods[id] ?? c.exclusiveMods[id] ?? null;
 }
 
 /**
@@ -432,7 +439,7 @@ export function getModGroup(group: string): PobMod[] {
 }
 
 /**
- * Total number of mod entries loaded. Diagnostic.
+ * Number of item-pool mod entries (excludes lookup-only Exclusive definitions).
  */
 export function getModCount(): number {
   return Object.keys(load().mods).length;

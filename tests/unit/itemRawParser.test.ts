@@ -15,6 +15,17 @@ Implicits: 1
 Corrupted`;
 
 describe('parseItemRawMods', () => {
+  it('counts granted skills inside PoE2 implicits instead of consuming an explicit modifier', () => {
+    const mods = parseItemRawMods('Rarity: RARE\nTest Staff\nParalysing Staff\nImplicits: 2\n{enchant}{rune}+1 to Level of all Spell Skills\nGrants Skill: Level 17 Enervating Nova\nGain 58% of Damage as Extra Cold Damage');
+    expect(mods.find(m => m.line === 'Grants Skill: Level 17 Enervating Nova')?.type).toBe('implicit');
+    expect(mods.find(m => m.line === 'Gain 58% of Damage as Extra Cold Damage')?.type).toBe('explicit');
+    expect(mods[0].type).toBe('enchant');
+  });
+
+  it('preserves bonded and desecrated modifiers and skips the sanctified state marker', () => {
+    const mods = parseItemRawMods('Implicits: 1\nBonded: +20 to maximum Life\n{desecrated}+30 to Spirit\nSanctified');
+    expect(mods).toEqual([{ line: 'Bonded: +20 to maximum Life', type: 'implicit' }, { line: '+30 to Spirit', type: 'desecrated' }]);
+  });
   it('separates implicit from explicit mods', () => {
     const mods = parseItemRawMods(RAW);
     const implicit = mods.filter((m) => m.type === 'implicit');

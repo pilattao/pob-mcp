@@ -109,8 +109,10 @@ const AUTO_VIEW_BY_TOOL: Record<string, string> = {
  * Used only for pre-dispatch argument validation below.
  */
 let argSpecByTool: Map<string, { required: string[]; declared: Set<string> }> | null = null;
+let argSpecGame: string | undefined;
 function getArgSpecByTool() {
-  if (!argSpecByTool) {
+  if (!argSpecByTool || argSpecGame !== process.env.POE_GAME) {
+    argSpecGame = process.env.POE_GAME;
     argSpecByTool = new Map();
     const all: any[] = [
       ...getToolSchemas(),
@@ -718,14 +720,14 @@ export async function routeToolCall(
 
     case "toggle_flask":
       if (!args) throw new Error("Missing arguments");
-      return await handleToggleFlask(itemSkillContext, args.flask_number as number, args.active as boolean);
+      return await handleToggleFlask(itemSkillContext, args.flask_number as number | undefined, args.active as boolean, args.slotName as string | undefined);
 
     case "get_skill_setup":
       return await handleGetSkillSetup(itemSkillContext, args?.main_only !== false);
 
     case "set_main_skill":
       if (!args) throw new Error("Missing arguments");
-      return await handleSetMainSkill(itemSkillContext, args.group_index as number, (args.active_skill_index ?? args.gem_index) as number | undefined, args.skill_part as number | undefined);
+      return await handleSetMainSkill(itemSkillContext, args.group_index as number, (args.active_skill_index ?? args.gem_index) as number | undefined, args.skill_part as number | undefined, args.stat_set as number | undefined);
 
     case "create_socket_group":
       return await handleCreateSocketGroup(itemSkillContext, args?.label as string | undefined, args?.slot as string | undefined, args?.enabled as boolean | undefined, args?.include_in_full_dps as boolean | undefined);
@@ -773,6 +775,8 @@ export async function routeToolCall(
         itemSkillContext,
         args.spectres as string[],
         args.mode as "replace" | "add" | undefined,
+        args.group_index as number | undefined,
+        args.gem_index as number | undefined,
       );
 
     case "setup_skill_with_gems": {

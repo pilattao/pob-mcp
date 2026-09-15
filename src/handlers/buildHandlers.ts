@@ -1,13 +1,13 @@
 import type { BuildService } from "../services/buildService.js";
 import type { TreeService } from "../services/treeService.js";
 import type { ValidationService } from "../services/validationService.js";
-import type { TreeAnalysisResult } from "../types.js";
 import type { HandlerContext } from "../utils/contextBuilder.js";
 import { PoBLuaTcpClient } from "../pobLuaBridge.js";
 import path from "path";
 import fs from "fs/promises";
 import { wrapHandler } from "../utils/errorHandling.js";
 import { sanitizeBuildName } from "../utils/pathSanitizer.js";
+import { costsPassivePoint, type BudgetTreeAnalysis } from '../services/passiveBudget.js';
 export type { HandlerContext } from "../utils/contextBuilder.js";
 
 export async function handleListBuilds(context: HandlerContext) {
@@ -28,7 +28,7 @@ export async function handleListBuilds(context: HandlerContext) {
 
 export async function handleAnalyzeBuild(context: HandlerContext, buildName: string) {
   return wrapHandler('analyze build', async () => {
-  const build = await context.buildService.readBuild(buildName);
+  let build = await context.buildService.readBuild(buildName);
 
   // Try to get live Lua stats — only load from file if no build is loaded.
   // If the same build is already loaded, preserve current spec/item set selection.
@@ -37,6 +37,7 @@ export async function handleAnalyzeBuild(context: HandlerContext, buildName: str
   let luaSkipped = false;
   let luaActiveSpecIndex: number | null = null;
   let luaActiveItemSetId: string | null = null;
+  let luaActiveSkillSetId: string | null = null;
   const specContextLines: string[] = [];
   try {
     await context.ensureLuaClient();
@@ -63,12 +64,21 @@ export async function handleAnalyzeBuild(context: HandlerContext, buildName: str
             shouldLoad = false;
           }
         }
-      } catch { /* no build loaded yet — safe to load */ }
+      } catch {
+        // Unknown live state is not permission to replace a user's open build.
+        shouldLoad = false;
+        luaSkipped = true;
+      }
 
       if (shouldLoad) {
         const buildPath = sanitizeBuildName(buildName, context.pobDirectory);
         const buildXml = await fs.readFile(buildPath, 'utf-8');
         await luaClient.loadBuildXml(buildXml);
+      }
+      if (!luaSkipped) {
+      if (typeof luaClient.exportBuildXml === 'function' && typeof context.buildService.parseBuildContent === 'function') {
+        const liveXml = await luaClient.exportBuildXml();
+        build = context.buildService.parseBuildContent(liveXml);
       }
       try { luaStats = await luaClient.getStats(); } catch { /* best effort */ }
 
@@ -76,6 +86,8 @@ export async function handleAnalyzeBuild(context: HandlerContext, buildName: str
       try {
         const specsResult = await luaClient.listSpecs();
         const itemSetsResult = await luaClient.listItemSets();
+        const skillsResult = await luaClient.getSkills?.();
+        if (skillsResult?.activeSkillSetId !== undefined) luaActiveSkillSetId = String(skillsResult.activeSkillSetId);
         const activeSpec = specsResult?.specs?.find((s: any) => s.active);
         const activeItemSet = itemSetsResult?.itemSets?.find((s: any) => s.active);
         if (activeSpec) luaActiveSpecIndex = activeSpec.index;
@@ -96,6 +108,7 @@ export async function handleAnalyzeBuild(context: HandlerContext, buildName: str
           }
         }
       } catch { /* advisory only */ }
+      }
     }
   } catch (error) {
     // Continue with XML-only analysis
@@ -111,8 +124,8 @@ export async function handleAnalyzeBuild(context: HandlerContext, buildName: str
     ...(luaActiveItemSetId !== null && build.Items
       ? { Items: { ...(build.Items as any), activeItemSet: luaActiveItemSetId } }
       : {}),
-    ...(luaActiveItemSetId !== null && build.Skills
-      ? { Skills: { ...(build.Skills as any), activeSkillSet: luaActiveItemSetId } }
+    ...(luaActiveSkillSetId !== null && build.Skills
+      ? { Skills: { ...(build.Skills as any), activeSkillSet: luaActiveSkillSetId } }
       : {}),
   };
 
@@ -120,7 +133,7 @@ export async function handleAnalyzeBuild(context: HandlerContext, buildName: str
 
   if (luaSkipped) {
     summaryParts.push(
-      "\n⚠️  Note: A different build is loaded in the Lua bridge. Stats shown are from that build.\n" +
+      "\nNote: A different build is open in PoB. This report uses the requested file; unrelated live stats are excluded.\n" +
       "    Use lua_load_build to load this build for accurate live stats."
     );
   }
@@ -135,11 +148,11 @@ export async function handleAnalyzeBuild(context: HandlerContext, buildName: str
     summaryParts.push([
       '\n=== Live Calculated Stats (from Lua) ===',
       '',
-      `Total DPS: ${luaStats.TotalDPS || 'N/A'}`,
-      `Combined DPS: ${luaStats.CombinedDPS || 'N/A'}`,
-      `Life: ${luaStats.Life || 'N/A'}`,
-      `Energy Shield: ${luaStats.EnergyShield || 'N/A'}`,
-      `Effective Life Pool: ${luaStats.TotalEHP || 'N/A'}`,
+      `Total DPS: ${luaStats.TotalDPS ?? 'N/A'}`,
+      `Combined DPS: ${luaStats.CombinedDPS ?? 'N/A'}`,
+      `Life: ${luaStats.Life ?? 'N/A'}`,
+      `Energy Shield: ${luaStats.EnergyShield ?? 'N/A'}`,
+      `Effective Life Pool: ${luaStats.TotalEHP ?? 'N/A'}`,
       '',
     ].join('\n'));
   }
@@ -179,7 +192,9 @@ export async function handleAnalyzeBuild(context: HandlerContext, buildName: str
 
   // Add tree analysis — buildForAnalysis already has the Lua-selected spec overridden
   try {
-    const treeAnalysis = await context.treeService.analyzePassiveTree(buildForAnalysis);
+    const treeAnalysis = luaStats
+      ? await context.treeService.analyzePassiveTree(buildForAnalysis, luaStats)
+      : await context.treeService.analyzePassiveTree(buildForAnalysis);
     if (treeAnalysis) {
       summaryParts.push(formatTreeAnalysis(treeAnalysis));
     } else {
@@ -190,6 +205,7 @@ export async function handleAnalyzeBuild(context: HandlerContext, buildName: str
     if (errorMsg.includes("Invalid passive tree data detected")) {
       // Return the full error message for invalid nodes
       return {
+        isError: true,
         content: [
           {
             type: "text" as const,
@@ -210,8 +226,8 @@ export async function handleAnalyzeBuild(context: HandlerContext, buildName: str
 
   // Add build validation (at the end, after all data sections)
   try {
-    const flaskAnalysis = context.buildService.parseFlasks(build);
-    const validation = context.validationService.validateBuild(build, flaskAnalysis, luaStats ?? undefined);
+    const flaskAnalysis = context.buildService.parseFlasks(buildForAnalysis);
+    const validation = context.validationService.validateBuild(buildForAnalysis, flaskAnalysis, luaStats ?? undefined);
     summaryParts.push("\n" + context.validationService.formatValidation(validation));
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
@@ -466,7 +482,7 @@ export async function handleSetBuildNotes(context: HandlerContext, buildName: st
   });
 }
 
-function formatTreeAnalysis(analysis: TreeAnalysisResult): string {
+function formatTreeAnalysis(analysis: BudgetTreeAnalysis): string {
   const lines: string[] = ['', '=== Passive Tree ==='];
 
   // Version warning
@@ -479,9 +495,17 @@ function formatTreeAnalysis(analysis: TreeAnalysisResult): string {
   }
 
   lines.push(`\nTree Version: ${analysis.treeVersion}`);
-  lines.push(`Total Points: ${analysis.totalPoints} / ${analysis.availablePoints} available`);
+  const budget = analysis.passiveBudget;
+  if (budget) {
+    lines.push(`Paid non-ascendancy nodes across both weapon sets: ${budget.nonAscendancyPoints}`);
+    lines.push(`Shared points: ${budget.sharedPoints}`);
+    budget.perWeaponPoints.forEach((points, i) => lines.push(`Weapon set ${i + 1}: ${points} / ${budget.availablePoints ?? 'unknown'} points (${budget.weaponSetPoints[i]} / ${budget.weaponSetLimit ?? 'unknown'} weapon-specific)`));
+    lines.push(...budget.notes, ...budget.warnings.map(w => `WARNING: ${w}`));
+  } else {
+    lines.push(`Total Points: ${analysis.totalPoints} / ${analysis.availablePoints} available`);
+  }
 
-  if (analysis.totalPoints > analysis.availablePoints) {
+  if (!budget && analysis.totalPoints > analysis.availablePoints) {
     lines.push(
       '\nWARNING: This build has more points allocated than available at this level.',
       'This is not possible in the actual game.'
@@ -490,11 +514,15 @@ function formatTreeAnalysis(analysis: TreeAnalysisResult): string {
 
   // Ascendancy nodes (separate from regular keystones/notables)
   const ascendancyNodes = analysis.allocatedNodes.filter(n => n.ascendancyName);
-  if (ascendancyNodes.length > 0) {
-    const ascendancyName = ascendancyNodes[0].ascendancyName;
-    lines.push(`\n=== Ascendancy: ${ascendancyName} (${ascendancyNodes.length} points) ===`);
-    for (const node of ascendancyNodes) {
-      let line = `- ${node.name}`;
+  const ascendancyGroups = budget
+    ? [...new Set(ascendancyNodes.map(n => n.ascendancyName))].map(name => ascendancyNodes.filter(n => n.ascendancyName === name))
+    : ascendancyNodes.length ? [ascendancyNodes] : [];
+  for (const nodes of ascendancyGroups) {
+    const ascendancyName = nodes[0].ascendancyName;
+    const spent = budget ? nodes.filter(costsPassivePoint).length : nodes.length;
+    lines.push(`\n=== Ascendancy: ${ascendancyName} (${spent} points) ===`);
+    for (const node of nodes) {
+      let line = `- ${node.name}${budget && !costsPassivePoint(node) ? ' (free/start; 0 points)' : ''}`;
       if (node.stats && node.stats.length > 0) {
         line += `: ${node.stats.join('; ')}`;
       }

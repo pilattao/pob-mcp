@@ -9,6 +9,9 @@ type LuaRequest = { action: string; params?: Record<string, unknown> };
 /** Lua bridge response envelope — always an object with at minimum `ok: boolean` */
 type LuaResponse = { ok: boolean; error?: string; [key: string]: unknown };
 
+/** PoE2 returns per-gem selections; PoE1 returns only the catalog ID/name. */
+type SpectreSelection = { id: string; name: string; groupIndex?: number; gemIndex?: number; enabled?: boolean };
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared base class
 // Both stdio (PoBLuaApiClient) and TCP (PoBLuaTcpClient) transports share all
@@ -155,8 +158,9 @@ abstract class PoBApiBase {
     return res.result as { slot: string; cleared: boolean };
   }
 
-  async setFlaskActive(flaskIndex: number, active: boolean): Promise<void> {
-    const res = await this.send({ action: "set_flask_active", params: { index: flaskIndex, active } });
+  async setFlaskActive(flaskIndex: number | undefined, active: boolean, slotName?: string): Promise<void> {
+    const params = slotName === undefined ? { index: flaskIndex, active } : { slotName, active };
+    const res = await this.send({ action: "set_flask_active", params });
     if (!res.ok) throw new Error(res.error || "set_flask_active failed");
   }
 
@@ -166,7 +170,7 @@ abstract class PoBApiBase {
     return res.skills;
   }
 
-  async setMainSelection(params: { mainSocketGroup?: number; mainActiveSkill?: number; skillPart?: number }): Promise<void> {
+  async setMainSelection(params: { mainSocketGroup?: number; mainActiveSkill?: number; skillPart?: number; statSet?: number }): Promise<void> {
     const res = await this.send({ action: "set_main_selection", params });
     if (!res.ok) throw new Error(res.error || "set_main_selection failed");
   }
@@ -177,6 +181,7 @@ abstract class PoBApiBase {
     secondaryAscendClassId?: number;
     nodes: number[];
     masteryEffects?: Record<number, number>;
+    weaponSets?: Record<number, number>;
     treeVersion?: string;
   }): Promise<any> {
     const res = await this.send({ action: "set_tree", params });
@@ -303,23 +308,23 @@ abstract class PoBApiBase {
   }
 
   async listSpectres(params: { search?: string }): Promise<{
-    active: Array<{ id: string; name: string }>;
+    active: SpectreSelection[];
     search_results?: Array<{ id: string; name: string }>;
   }> {
     const res = await this.send({ action: "list_spectres", params });
     if (!res.ok) throw new Error(res.error || "list_spectres failed");
     return res.result as {
-      active: Array<{ id: string; name: string }>;
+      active: SpectreSelection[];
       search_results?: Array<{ id: string; name: string }>;
     };
   }
 
-  async setSpectres(params: { spectres: string[]; mode?: "replace" | "add" }): Promise<{
-    active: Array<{ id: string; name: string }>;
+  async setSpectres(params: { spectres: string[]; mode?: "replace" | "add"; groupIndex?: number; gemIndex?: number }): Promise<{
+    active: SpectreSelection[];
   }> {
     const res = await this.send({ action: "set_spectres", params });
     if (!res.ok) throw new Error(res.error || "set_spectres failed");
-    return res.result as { active: Array<{ id: string; name: string }> };
+    return res.result as { active: SpectreSelection[] };
   }
 
   async searchNodes(params: { keyword: string; nodeType?: string; maxResults?: number; includeAllocated?: boolean }): Promise<any> {
@@ -746,7 +751,14 @@ export class PoBLuaTcpClient extends PoBApiBase {
   }
 
   async start(): Promise<void> {
-    if (this.socket) return;
+    if (this.isAlive()) return;
+    // Reconnects must start with fresh framing and liveness state. Old socket
+    // callbacks below are ignored after ownership moves to the new socket.
+    this.socket?.destroy();
+    this.socket = null;
+    this.buffer = "";
+    this.ready = false;
+    this.killed = false;
     const { host, port, timeoutMs } = this.options;
 
     const sock = createConnection({ host, port });
@@ -779,12 +791,14 @@ export class PoBLuaTcpClient extends PoBApiBase {
     const dbg = process.env.POB_DEBUG === "true";
 
     sock.on("data", (chunk: string) => {
+      if (this.socket !== sock) return;
       if (dbg) console.error("[PoB TCP data]", JSON.stringify(chunk.slice(0, 120)));
       this.buffer += chunk;
       this.dataEmitter.emit("data");
     });
 
     sock.on("close", () => {
+      if (this.socket !== sock) return;
       if (dbg) console.error("[PoB TCP] socket closed");
       this.killed = true;
       this.ready = false;
@@ -792,6 +806,7 @@ export class PoBLuaTcpClient extends PoBApiBase {
     });
 
     sock.on("error", (err) => {
+      if (this.socket !== sock) return;
       if (dbg) console.error("[PoB TCP] socket error:", err.message);
       this.killed = true;
       this.ready = false;

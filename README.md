@@ -1,3 +1,9 @@
+> **PoE2 port (`poe2-port`).** Use `POE_GAME=poe2` and a complete
+> `POB_INSTALL_DIR`. This branch supports native PoB2 XML, tree/data sources and
+> calculation API contracts. Full restoration is in progress; atlas/jewel
+> integration and several inherited optimizers still need validation.
+> See the [suite port documentation](https://github.com/pilattao/poe_mcp_suite/blob/poe2-port/docs/poe2/README.md).
+
 # Path of Building MCP Server
 
 > **This product is not affiliated with or endorsed by Grinding Gear Games in any way.**

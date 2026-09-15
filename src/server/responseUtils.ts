@@ -20,6 +20,7 @@ export type ToolResponse = {
  * @returns Truncated text with helpful message if truncated
  */
 export function truncateResponse(text: string, maxLength: number = 5000): string {
+  if (maxLength === 0) return text;
   if (text.length <= maxLength) {
     return text;
   }
@@ -42,10 +43,15 @@ export function truncateResponse(text: string, maxLength: number = 5000): string
  * @param maxLength - Maximum length before truncation (default: 5000 to minimize tokens)
  * @returns The result with text truncated if needed
  */
-export function wrapWithTruncation(
-  result: ToolResponse,
-  maxLength: number = 5000
-): ToolResponse {
+function configuredLimit(): number {
+  const value = Number(process.env.POB_MAX_RESPONSE_CHARS ?? 5000);
+  return Number.isSafeInteger(value) && value >= 0 ? value : 5000;
+}
+
+export function wrapWithTruncation<T extends ToolResponse>(
+  result: T,
+  maxLength: number = configuredLimit()
+): T {
   if (result.content[0] && result.content[0].type === 'text') {
     result.content[0].text = truncateResponse(result.content[0].text, maxLength);
   }
